@@ -147,7 +147,7 @@ public struct TranscriptState: Hashable, Sendable {
                 entry.resultIsError = isError
                 entry.status = entry.resolvedStatus
                 entries[index] = .toolCall(entry)
-            } else if orphanCallIDs.count < policy.maxOrphanResults {
+            } else if orphanCallIDs.count < max(0, policy.maxOrphanResults) {
                 orphanCallIDs.insert(callID)
                 append(.toolCall(ToolCallEntry(callID: callID, name: nil, status: .resultBeforeStart,
                                                output: output, resultIsError: isError,
@@ -185,8 +185,13 @@ public struct TranscriptState: Hashable, Sendable {
     }
 
     private mutating func trimIfNeeded() {
-        guard entries.count > policy.maxEntries else { return }
-        let excess = entries.count - policy.maxEntries
+        // `policy.maxEntries` is a `public var`, so the value clamped in
+        // `init` is not an invariant a caller has to respect. Re-clamp here:
+        // a negative cap would otherwise make `excess` exceed `entries.count`
+        // and trip `removeFirst`'s precondition.
+        let cap = max(1, policy.maxEntries)
+        guard entries.count > cap else { return }
+        let excess = min(entries.count, entries.count - cap)
         let removed = entries.prefix(excess)
         entries.removeFirst(excess)
         droppedFromFront = Saturating.add(droppedFromFront, excess)

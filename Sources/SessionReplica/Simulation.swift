@@ -338,6 +338,10 @@ public enum ChaosScheduler {
             index = end
         }
         var frames: [Frame] = []
+        // `heartbeatEvery` is a `public var`, so the value clamped in `init`
+        // is not an invariant a caller has to respect. A zero here would trap
+        // on the modulo below.
+        let heartbeatEvery = max(1, policy.heartbeatEvery)
         for (i, event) in reordered.enumerated() {
             if let stall = policy.stallAfterFrames, frames.count >= stall {
                 frames.append(.stall)
@@ -348,7 +352,7 @@ public enum ChaosScheduler {
                 return frames
             }
             frames.append(.event(event))
-            if (i + 1) % policy.heartbeatEvery == 0 { frames.append(.heartbeat) }
+            if (i + 1) % heartbeatEvery == 0 { frames.append(.heartbeat) }
         }
         frames.append(.heartbeat)
         return frames
@@ -365,12 +369,18 @@ public final class ChaosTransport: SessionTransport, @unchecked Sendable {
     private var currentContinuation: AsyncStream<TransportFrame>.Continuation?
     private var currentTask: Task<Void, Never>?
     /// Milliseconds between frames, for the demo's live feel. 0 in tests.
-    public var pacing: Millis
+    /// Guarded by `lock` like every other mutable field: this type is
+    /// `@unchecked Sendable`, so the compiler checks nothing here.
+    private var _pacing: Millis
+    public var pacing: Millis {
+        get { lock.withLock { _pacing } }
+        set { lock.withLock { _pacing = newValue } }
+    }
 
     public init(server: ScriptedSessionServer, policy: ChaosPolicy = .clean, pacing: Millis = 0) {
         self.server = server
         self.policy = policy
-        self.pacing = pacing
+        self._pacing = pacing
     }
 
     public var connections: Int { lock.withLock { connectionIndex } }
@@ -381,12 +391,18 @@ public final class ChaosTransport: SessionTransport, @unchecked Sendable {
 
     public func open(resumingFrom cursor: ReplicaCursor) -> AsyncStream<TransportFrame> {
         let (stream, continuation) = AsyncStream<TransportFrame>.makeStream(bufferingPolicy: .unbounded)
+        // The generation counter is what makes the hand-off safe: a task only
+        // installs itself as `currentTask` if no newer `open` (or a `close`,
+        // which bumps the generation too) has happened since it was created.
+        // Without it, a `close()` racing between here and the assignment would
+        // be overtaken by a task it never saw, leaving it yielding heartbeats
+        // into a finished continuation.
         let (index, policy, pacing): (Int, ChaosPolicy, Millis) = lock.withLock {
             currentTask?.cancel()
             currentContinuation?.finish()
             connectionIndex += 1
             currentContinuation = continuation
-            return (connectionIndex, self.policy, self.pacing)
+            return (connectionIndex, self.policy, self._pacing)
         }
         let server = self.server
         let task = Task { [weak self] in
@@ -410,7 +426,7 @@ public final class ChaosTransport: SessionTransport, @unchecked Sendable {
                     continuation.yield(.event(await server.heartbeat()))
                 case .stall:
                     // Heartbeats keep flowing, content does not.
-                    while stalledHeartbeats < policy.stallHeartbeats, !Task.isCancelled {
+                    while stalledHeartbeats < max(1, policy.stallHeartbeats), !Task.isCancelled {
                         if pacing > 0 { try? await Task.sleep(nanoseconds: Saturating.multiply(pacing, 20_000_000)) }
                         continuation.yield(.event(await server.heartbeat()))
                         stalledHeartbeats += 1
@@ -431,21 +447,36 @@ public final class ChaosTransport: SessionTransport, @unchecked Sendable {
                     continuation.yield(.snapshot(await server.snapshot()))
                 }
             }
-            // Keep the connection open with heartbeats until cancelled, so the
-            // supervisor sees a healthy idle link rather than a dropped one.
+            // Keep the connection open until cancelled, delivering anything the
+            // server appends after the scripted turn — a command acknowledgement,
+            // for instance. Without this the link would look healthy (heartbeats)
+            // while starving content, which is precisely the *degraded* condition:
+            // an ack on a clean link would only arrive via a resync seconds later.
+            var deliveredThrough = await server.newestSequence
             while !Task.isCancelled {
                 if pacing > 0 {
-                    try? await Task.sleep(nanoseconds: Saturating.multiply(max(pacing, 1), 40_000_000))
+                    try? await Task.sleep(nanoseconds: Saturating.multiply(max(pacing, 1), 4_000_000))
                 } else {
                     try? await Task.sleep(nanoseconds: 5_000_000)
                 }
                 if let self, self.snapshotRequested(clearing: true) {
                     continuation.yield(.snapshot(await server.snapshot()))
+                    deliveredThrough = await server.newestSequence
+                }
+                let fresh = await server.log.filter { $0.id.sequence > deliveredThrough }
+                for event in fresh {
+                    continuation.yield(.event(event))
+                    deliveredThrough = event.id.sequence
                 }
                 continuation.yield(.event(await server.heartbeat()))
             }
         }
-        lock.withLock { currentTask = task }
+        let installed = lock.withLock { () -> Bool in
+            guard connectionIndex == index else { return false }
+            currentTask = task
+            return true
+        }
+        if !installed { task.cancel(); continuation.finish() }
         continuation.onTermination = { _ in task.cancel() }
         return stream
     }
@@ -472,6 +503,11 @@ public final class ChaosTransport: SessionTransport, @unchecked Sendable {
         lock.withLock {
             currentTask?.cancel()
             currentContinuation?.finish()
+            currentTask = nil
+            currentContinuation = nil
+            // Bump the generation so a task created by an `open` that is still
+            // in flight cannot install itself after this close.
+            connectionIndex += 1
         }
     }
 }

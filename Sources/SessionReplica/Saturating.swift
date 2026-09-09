@@ -44,11 +44,12 @@ public enum Saturating {
     /// `2^exponent` as a `UInt64`, saturating instead of shifting past the
     /// width. A shift by 64 or more silently yields zero in Swift's smart
     /// shift, which would turn an intended "very long backoff" into "retry
-    /// immediately" — the opposite of what a degraded link needs.
+    /// immediately" — the opposite of what a degraded link needs. `2^63` is
+    /// representable and is returned exactly; only 64 and above saturate.
     @inlinable
     public static func powerOfTwo(_ exponent: Int) -> UInt64 {
         guard exponent >= 0 else { return 1 }
-        guard exponent < UInt64.bitWidth - 1 else { return UInt64.max }
+        guard exponent < UInt64.bitWidth else { return UInt64.max }
         return UInt64(1) << UInt64(exponent)
     }
 

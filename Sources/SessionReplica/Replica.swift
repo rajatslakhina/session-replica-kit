@@ -1,12 +1,18 @@
 /// The replica itself: one actor that composes the ingestor, the transcript
 /// reducer, the outbox, the supervisor, the publish gate and the journal.
 ///
-/// Concurrency contract: **every state-mutating method is synchronous.** The
-/// only `await`s live in `run(transport:)`, which reads frames from a
-/// transport and hands each one to a synchronous method. Because no method
-/// suspends mid-mutation, there is no window in which a `send(_:)` from the
-/// UI can observe a half-applied frame — the classic actor-reentrancy bug is
-/// structurally impossible here rather than merely avoided.
+/// Concurrency contract: **every method that applies a frame is synchronous.**
+/// `receive(_:)`, `receive(snapshot:)`, `enqueue`, `report` and `tick` never
+/// suspend, so no frame is ever half-applied and no UI call can observe a
+/// transcript that is part-way through a snapshot swap.
+///
+/// The driver — `run(transport:)` and the two private helpers it calls — is
+/// `async` and *does* suspend, at `transport.deliver` and
+/// `transport.requestSnapshot`. Those suspension points are placed where the
+/// replica's state is already consistent, and the state they touch afterwards
+/// (`snapshotRequestInFlight`, and the outbox entry named by a command id) is
+/// idempotent under reentry. That is a narrower claim than "reentrancy is
+/// impossible", and it is the true one.
 
 /// What a transport delivers to the replica.
 public enum TransportFrame: Sendable {
@@ -113,6 +119,11 @@ public actor SessionReplica {
     private let jitterSource: @Sendable () -> Double
     private let publishContinuation: AsyncStream<ReplicaView>.Continuation
     /// Views are published through here. The UI observes it.
+    ///
+    /// This is created once and cannot be recreated. Cancelling the task that
+    /// consumes it *finishes the stream*, so a client must keep one long-lived
+    /// observer for the lifetime of the replica rather than cancelling and
+    /// restarting it.
     public nonisolated let views: AsyncStream<ReplicaView>
 
     public init(configuration: ReplicaConfiguration = .default,

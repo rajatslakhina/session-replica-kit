@@ -112,6 +112,12 @@ public struct CommandOutbox: Hashable, Sendable {
     private var commands: [CommandID: OutboundCommand] = [:]
     private var nextOrdinal: UInt64 = 0
     public private(set) var transitions: [CommandTransition] = []
+    /// Terminal commands evicted from the display history. Reported rather
+    /// than dropped silently — a bounded buffer that hides its losses is
+    /// indistinguishable from one that loses data.
+    public private(set) var historyEvicted: Int = 0
+    /// Transitions dropped off the front of the journal.
+    public private(set) var transitionsDropped: Int = 0
 
     public init(policy: OutboxPolicy = .default) {
         self.policy = policy
@@ -216,15 +222,20 @@ public struct CommandOutbox: Hashable, Sendable {
     }
 
     private mutating func evictHistoryIfNeeded() {
+        // `historyLimit` is a `public var`; re-clamp rather than trust it.
+        let limit = max(0, policy.historyLimit)
         let terminal = all.filter { $0.state.isTerminal }
-        guard terminal.count > policy.historyLimit else { return }
-        for command in terminal.prefix(terminal.count - policy.historyLimit) {
+        guard terminal.count > limit else { return }
+        for command in terminal.prefix(terminal.count - limit) {
             commands.removeValue(forKey: command.id)
+            historyEvicted = Saturating.add(historyEvicted, 1)
         }
         // The transition journal is bounded too: keep the newest 4× history.
-        let journalLimit = Saturating.multiply(max(policy.historyLimit, 16), 4)
+        let journalLimit = Saturating.multiply(max(limit, 16), 4)
         if transitions.count > journalLimit {
-            transitions.removeFirst(transitions.count - journalLimit)
+            let excess = transitions.count - journalLimit
+            transitions.removeFirst(excess)
+            transitionsDropped = Saturating.add(transitionsDropped, excess)
         }
     }
 }
