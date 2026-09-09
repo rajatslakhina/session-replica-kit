@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux · clean build (warnings as errors) + tests
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      # `-warnings-as-errors` lives here rather than in prose, so "zero
+      # warnings" is machine-enforced. The checkout is clean, so this is a real
+      # from-scratch compile of every file, not an up-to-date no-op.
+      - name: Build (core; the UI target is empty off-Apple platforms)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Build tests (warnings as errors)
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+
+      # Includes the negative controls in InvariantTests (deliberately broken
+      # journals must FAIL the checker), the chaos-scheduler control in
+      # ChaosTests (a no-op scheduler must fail), and ConcurrencyTests, which
+      # runs four real concurrent writers against the actor.
+      - name: Test
+        run: swift test
+
+  ios:
+    name: iOS Simulator · compile
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # `generic/platform=iOS Simulator` deliberately, never a named device:
+      # pinning to `name=iPhone 16` ties the job to whichever simulator
+      # runtimes happen to be installed on that day's runner image, and a
+      # compile check needs no device to exist. This is the only job that
+      # compiles the SwiftUI module for real; on Linux it is an empty target.
+      - name: List schemes
+        run: xcodebuild -list
+
+      - name: Build for iOS Simulator
+        run: xcodebuild build -scheme SessionReplicaUI -destination 'generic/platform=iOS Simulator'
