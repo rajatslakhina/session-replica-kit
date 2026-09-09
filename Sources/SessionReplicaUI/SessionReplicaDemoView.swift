@@ -4,6 +4,28 @@ import SwiftUI
 import Observation
 import SessionReplica
 
+/// Holds the model's long-lived tasks somewhere a `nonisolated deinit` can
+/// legally reach them. A `@MainActor` class cannot touch its own isolated
+/// stored properties from `deinit`, but it *can* touch an immutable `let` of a
+/// `Sendable` type — which is what this is.
+private final class TaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [Task<Void, Never>] = []
+
+    func add(_ task: Task<Void, Never>) {
+        lock.lock(); defer { lock.unlock() }
+        tasks.append(task)
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let current = tasks
+        tasks.removeAll()
+        lock.unlock()
+        for task in current { task.cancel() }
+    }
+}
+
 /// Drives one `SessionReplica` against a `ChaosTransport` and exposes the
 /// published views to SwiftUI. Everything that mutates the replica goes
 /// through the actor; this object only mirrors the latest `ReplicaView`.
@@ -22,6 +44,16 @@ public final class SessionReplicaDemoModel {
     public let server: ScriptedSessionServer
     private var runTask: Task<Void, Never>?
     private var observeTask: Task<Void, Never>?
+    private let liveTasks = TaskBox()
+
+    /// A model that is released without `shutDown()` — a SwiftUI preview, a
+    /// tab that goes away, a test that drops its reference — would otherwise
+    /// leave its run loop and observer running forever, holding the replica,
+    /// transport and server alive with them.
+    deinit {
+        liveTasks.cancelAll()
+        transport.close()
+    }
 
     public init(server: ScriptedSessionServer,
                 transport: ChaosTransport,
@@ -36,24 +68,27 @@ public final class SessionReplicaDemoModel {
     }
 
     public func start() {
-        // The view observer is started exactly once and never cancelled while
-        // the model lives. Cancelling the *consumer* of an `AsyncStream`
-        // finishes the stream itself, and `replica.views` is a `let` created in
-        // the replica's `init` — so cancelling here would permanently kill
-        // every future publish and freeze the UI on its last frame. Only the
-        // run loop is restarted on reconnect.
+        // `replica.views` vends a *fresh* stream per call, so cancelling this
+        // observer finishes only this observer's stream and other observers
+        // (and future ones) are unaffected. It is still started once and kept
+        // for the model's lifetime: restarting it on every reconnect would
+        // churn subscriptions for no benefit. Only the run loop is restarted.
         if observeTask == nil {
-            observeTask = Task { [weak self, replica] in
+            let task = Task { [weak self, replica] in
                 for await view in replica.views {
                     guard let self else { return }
                     self.view = view
                 }
             }
+            observeTask = task
+            liveTasks.add(task)
         }
         guard runTask == nil else { return }
-        runTask = Task { [replica, transport] in
+        let task = Task { [replica, transport] in
             await replica.run(transport: transport, tickEvery: 50)
         }
+        runTask = task
+        liveTasks.add(task)
     }
 
     /// Stops the run loop and drops the link. The view observer stays alive so
@@ -368,7 +403,7 @@ public struct SessionReplicaDemoView: View {
 
     private var chaosTab: some View {
         Form {
-            Section("Link faults (applied to the next connection)") {
+            Section("Link faults (toggles apply now; sliders on \"Apply\")") {
                 LabeledContent("Drop \(Saturating.int(from: model.chaos.dropProbability * 100))%") {
                     Slider(value: $model.chaos.dropProbability, in: 0...0.5)
                 }
@@ -376,12 +411,16 @@ public struct SessionReplicaDemoView: View {
                     Slider(value: $model.chaos.duplicateProbability, in: 0...0.5)
                 }
                 Stepper("Reorder window: \(model.chaos.reorderWindow)", value: $model.chaos.reorderWindow, in: 1...8)
+                // The toggles apply immediately. The sliders and the stepper do
+                // not: they emit continuously while dragging, and re-arming the
+                // transport on every intermediate value would restart the
+                // schedule dozens of times per drag. Those wait for "Apply".
                 Toggle("Disconnect after 25 frames", isOn: Binding(
                     get: { model.chaos.disconnectAfterFrames != nil },
-                    set: { model.chaos.disconnectAfterFrames = $0 ? 25 : nil }))
+                    set: { model.chaos.disconnectAfterFrames = $0 ? 25 : nil; model.applyChaos() }))
                 Toggle("Stall after 12 frames (heartbeats only)", isOn: Binding(
                     get: { model.chaos.stallAfterFrames != nil },
-                    set: { model.chaos.stallAfterFrames = $0 ? 12 : nil }))
+                    set: { model.chaos.stallAfterFrames = $0 ? 12 : nil; model.applyChaos() }))
                 Button("Apply chaos policy") { model.applyChaos() }
                 Button("Preset: hostile network") { model.chaos = .hostile; model.applyChaos() }
                 Button("Preset: clean") { model.chaos = .clean; model.applyChaos() }
@@ -461,7 +500,8 @@ public struct SessionReplicaDemoView: View {
         let invariants = model.view?.invariants
         return List {
             Section("Exactly-once") {
-                metric("Events received", m.eventsReceived)
+                metric("Frames received (incl. heartbeats)", m.eventsReceived)
+                metric("Content received", m.contentReceived)
                 metric("Applied", m.eventsApplied)
                 metric("Duplicates dropped", m.duplicatesDropped)
                 metric("Buffered (out of order)", m.buffered)
@@ -480,10 +520,12 @@ public struct SessionReplicaDemoView: View {
             }
             Section("Backpressure") {
                 metric("UI publishes", m.publishes)
+                metric("Views conflated away", m.viewsDropped)
                 LabeledContent("Events per publish", value: m.publishes > 0
                                ? String(format: "%.1f", Double(m.eventsApplied) / Double(m.publishes)) : "—")
                 metric("Transcript entries", model.view?.transcript.entries.count ?? 0)
                 metric("Transcript entries dropped", model.view?.transcript.droppedFromFront ?? 0)
+                metric("Characters elided", model.view?.transcript.charactersElided ?? 0)
             }
             Section("Invariants (re-derived from the journal)") {
                 if let invariants {
