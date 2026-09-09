@@ -153,6 +153,31 @@ public struct CommandOutbox: Hashable, Sendable {
         transition(id, to: .inFlight, allowedFrom: [.queued]) { $0.countAttempt() }
     }
 
+    /// The link died. Anything in flight or awaiting the agent is stranded:
+    /// the transport will never report on it, and `nextToSend` only picks
+    /// `.queued`, so without this the command sits forever in a non-terminal
+    /// state and the retry story is a fiction.
+    ///
+    /// Commands that exhausted their attempts fail instead of looping, and
+    /// `.parkedAtRelay` is deliberately *left alone* — the relay has it and
+    /// will forward it when the machine comes back, so re-sending would be
+    /// wrong even though the socket is gone.
+    @discardableResult
+    public mutating func connectionLost(reason: String) -> [CommandTransition] {
+        var applied: [CommandTransition] = []
+        for command in all where command.state == .inFlight || command.state == .forwardedToMachine {
+            let from = command.state
+            let target: CommandState = command.attempts < policy.maxAttempts
+                ? .queued
+                : .failed(reason: reason)
+            if case .success = transition(command.id, to: target,
+                                          allowedFrom: [.inFlight, .forwardedToMachine]) {
+                applied.append(CommandTransition(id: command.id, from: from, to: target))
+            }
+        }
+        return applied
+    }
+
     public mutating func apply(_ report: TransportReport, to id: CommandID) -> Result<Void, OutboxError> {
         switch report {
         case .sent:

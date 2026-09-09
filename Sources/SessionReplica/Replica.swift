@@ -14,6 +14,91 @@
 /// idempotent under reentry. That is a narrower claim than "reentrancy is
 /// impossible", and it is the true one.
 
+import Foundation
+
+/// Fan-out for published views. Each observer gets its own one-slot
+/// `AsyncStream`, so they cannot interfere: a UI observer that stops reading
+/// evicts only its own buffered view, and a cancelled observer finishes only
+/// its own stream.
+///
+/// `@unchecked Sendable` is earned rather than asserted: every stored property
+/// below is read and written only inside `lock`, and no reference to the
+/// mutable state escapes. Continuations are yielded outside the lock, because
+/// `yield` can synchronously resume a consumer and re-entering the lock from
+/// there would deadlock.
+final class ViewObservers: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [Int: AsyncStream<ReplicaView>.Continuation] = [:]
+    private var nextToken = 0
+    private var latest: ReplicaView?
+    private var dropped = 0
+    private var finished = false
+
+    /// Total views evicted, across all observers, because the observer had not
+    /// read the previous one.
+    var droppedCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return dropped
+    }
+
+    var observerCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return continuations.count
+    }
+
+    func makeStream() -> AsyncStream<ReplicaView> {
+        let (stream, continuation) = AsyncStream<ReplicaView>.makeStream(bufferingPolicy: .bufferingNewest(1))
+
+        lock.lock()
+        if finished {
+            lock.unlock()
+            continuation.finish()
+            return stream
+        }
+        let token = nextToken
+        nextToken = Saturating.add(nextToken, 1)
+        continuations[token] = continuation
+        let current = latest
+        lock.unlock()
+
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            self.lock.lock()
+            self.continuations.removeValue(forKey: token)
+            self.lock.unlock()
+        }
+        // Seed the new observer so it renders immediately.
+        if let current { _ = continuation.yield(current) }
+        return stream
+    }
+
+    func yield(_ view: ReplicaView) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        latest = view
+        let targets = Array(continuations.values)
+        lock.unlock()
+
+        var evicted = 0
+        for continuation in targets {
+            if case .dropped = continuation.yield(view) { evicted += 1 }
+        }
+        guard evicted > 0 else { return }
+        lock.lock()
+        dropped = Saturating.add(dropped, evicted)
+        lock.unlock()
+    }
+
+    func finish() {
+        lock.lock()
+        finished = true
+        let targets = Array(continuations.values)
+        continuations.removeAll()
+        lock.unlock()
+        for continuation in targets { continuation.finish() }
+    }
+}
+
 /// What a transport delivers to the replica.
 public enum TransportFrame: Sendable {
     case event(SessionEvent)
@@ -36,7 +121,13 @@ public protocol SessionTransport: Sendable {
 }
 
 public struct ReplicaMetrics: Hashable, Sendable {
+    /// Every frame, including heartbeats.
     public var eventsReceived: Int = 0
+    /// Frames that carried content — `eventsReceived` minus heartbeats. This,
+    /// not `eventsReceived`, is the denominator of `applyRatio`: an idle link
+    /// emits heartbeats forever, so a ratio that counted them would decay
+    /// towards zero with wall-clock time no matter how correct the replica is.
+    public var contentReceived: Int = 0
     public var eventsApplied: Int = 0
     public var duplicatesDropped: Int = 0
     public var buffered: Int = 0
@@ -45,17 +136,22 @@ public struct ReplicaMetrics: Hashable, Sendable {
     public var resyncs: Int = 0
     public var snapshotsApplied: Int = 0
     public var publishes: Int = 0
+    /// Views evicted from an observer's one-slot buffer because that observer
+    /// had not read the previous one. Non-zero is healthy: it is conflation
+    /// working, and it is the observable difference between a conflating
+    /// buffer and an unbounded queue.
+    public var viewsDropped: Int = 0
     public var reconnects: Int = 0
     public var commandsSent: Int = 0
     public var commandsAcknowledged: Int = 0
 
     public init() {}
 
-    /// Applied ÷ received. Under chaos this is the number that proves the
-    /// duplicates and reorders were absorbed rather than rendered.
+    /// Applied ÷ content received. Under chaos this is the number that proves
+    /// the duplicates and reorders were absorbed rather than rendered.
     public var applyRatio: Double {
-        guard eventsReceived > 0 else { return 0 }
-        return Double(eventsApplied) / Double(eventsReceived)
+        guard contentReceived > 0 else { return 0 }
+        return Double(eventsApplied) / Double(contentReceived)
     }
 }
 
@@ -117,14 +213,24 @@ public actor SessionReplica {
 
     private let clock: @Sendable () -> Millis
     private let jitterSource: @Sendable () -> Double
-    private let publishContinuation: AsyncStream<ReplicaView>.Continuation
-    /// Views are published through here. The UI observes it.
+    private let observers: ViewObservers
+
+    /// A new stream of views, conflated to the newest. **Each call returns a
+    /// fresh, independent stream**, so a UI observer and a telemetry observer
+    /// can run side by side, and cancelling either one leaves the other
+    /// running.
     ///
-    /// This is created once and cannot be recreated. Cancelling the task that
-    /// consumes it *finishes the stream*, so a client must keep one long-lived
-    /// observer for the lifetime of the replica rather than cancelling and
-    /// restarting it.
-    public nonisolated let views: AsyncStream<ReplicaView>
+    /// This is a *property that vends*, not a shared stream: `AsyncStream`
+    /// permits exactly one iterator, so a single stored `let views` would trap
+    /// the moment a second observer called `next()`. Reading `views` twice and
+    /// iterating both is the first thing any adopter does, and it must not be
+    /// the thing that crashes their app.
+    ///
+    /// A new observer is handed the current view immediately rather than
+    /// waiting for the next publish, so a late subscriber never renders blank.
+    public nonisolated var views: AsyncStream<ReplicaView> {
+        observers.makeStream()
+    }
 
     public init(configuration: ReplicaConfiguration = .default,
                 clock: @escaping @Sendable () -> Millis,
@@ -139,15 +245,27 @@ public actor SessionReplica {
         self.jitterSource = jitter
         // Views are conflated: a slow consumer sees the newest, never a
         // backlog — the stream is the second half of the backpressure story.
-        let (stream, continuation) = AsyncStream<ReplicaView>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        self.views = stream
-        self.publishContinuation = continuation
+        self.observers = ViewObservers()
     }
 
     // MARK: - Synchronous state machine
 
     /// The current view, on demand.
     public var view: ReplicaView { makeView() }
+
+    /// Memoised invariant report, keyed on the journal revision that produced
+    /// it. The journal is the checker's only input, so an unchanged revision
+    /// means an unchanged verdict.
+    private var cachedInvariants: (revision: UInt64, report: InvariantReport)?
+
+    private func currentInvariants() -> InvariantReport {
+        if let cached = cachedInvariants, cached.revision == journal.revision {
+            return cached.report
+        }
+        let report = ReplicaInvariants.validate(journal)
+        cachedInvariants = (journal.revision, report)
+        return report
+    }
 
     private func makeView() -> ReplicaView {
         ReplicaView(transcript: transcript,
@@ -160,12 +278,15 @@ public actor SessionReplica {
                     metrics: metrics,
                     lastReconciliation: lastReconciliation,
                     awaitingResync: ingestor.awaitingResync,
-                    invariants: ReplicaInvariants.validate(journal))
+                    invariants: currentInvariants())
     }
 
     private func publish() {
         metrics.publishes = Saturating.add(metrics.publishes, 1)
-        publishContinuation.yield(makeView())
+        // Fan out first, then read back how many observers evicted an unread
+        // view, so the *next* view carries an accurate count.
+        observers.yield(makeView())
+        metrics.viewsDropped = observers.droppedCount
     }
 
     /// Handles one incoming event. Returns the ingest decision for tests;
@@ -178,14 +299,33 @@ public actor SessionReplica {
         if case .heartbeat(let newest) = event.kind {
             // Heartbeats are liveness, not content: they never move the cursor
             // and are not sequenced, so they bypass the ingestor's ordering.
-            supervisor.handle(.heartbeatReceived(now: now, serverNewest: newest, cursorApplied: ingestor.cursor.lastApplied))
-                .forEach(perform)
+            let statusOnlyBefore = statusOnly
+            // A heartbeat from a *different* epoch carries a sequence number
+            // from a different sequence line, so comparing it against this
+            // epoch's cursor is meaningless — after a teleport, epoch 2's
+            // sequence 3 would read as "we are ahead" and clear the lag timer.
+            // Liveness still counts; the lag comparison does not.
+            if event.id.epoch == ingestor.cursor.epoch {
+                supervisor.handle(.heartbeatReceived(now: now, serverNewest: newest, cursorApplied: ingestor.cursor.lastApplied))
+                    .forEach(perform)
+            } else {
+                supervisor.handle(.heartbeatReceived(now: now, serverNewest: 0, cursorApplied: 0)).forEach(perform)
+            }
             if let reason = ingestor.observe(heartbeatNewest: newest, epoch: event.id.epoch) {
                 noteResync(reason)
+            } else if statusOnly != statusOnlyBefore {
+                // Entering or leaving `degraded` is exactly the transition the
+                // status bar exists to show. `noteResync` publishes; this path
+                // otherwise would not, and the next `tick` only publishes when
+                // content is pending or the supervisor emitted an action —
+                // neither of which is true during a stall. Without this the UI
+                // reads "Live" for seconds after the link went status-only.
+                publish()
             }
             return nil
         }
 
+        metrics.contentReceived = Saturating.add(metrics.contentReceived, 1)
         let decision = ingestor.ingest(event)
         switch decision {
         case .apply(let events):
@@ -231,7 +371,16 @@ public actor SessionReplica {
             state = new
         case .commandAcknowledged(let id, let accepted):
             let before = outbox[id]?.state
-            if case .success = outbox.acknowledge(id, accepted: accepted), let before {
+            // `acknowledge` is idempotent: a replayed ack for an already
+            // acknowledged command returns `.success` without transitioning.
+            // Recording that as `acknowledged → acknowledged` would write an
+            // illegal terminal-to-terminal edge into the journal, and the
+            // independent checker would then — correctly — report FAIL for a
+            // replica that did nothing wrong. A snapshot that closes a command
+            // followed by a resume that replays its ack is the ordinary case,
+            // not an exotic one, so this guard is load-bearing.
+            if case .success = outbox.acknowledge(id, accepted: accepted),
+               let before, !before.isTerminal {
                 metrics.commandsAcknowledged = Saturating.add(metrics.commandsAcknowledged, 1)
                 journal.record(.commandTransition(CommandTransition(id: id, from: before, to: .acknowledged(accepted: accepted))))
             }
@@ -272,8 +421,14 @@ public actor SessionReplica {
         let before = Dictionary(uniqueKeysWithValues: outbox.all.map { ($0.id, $0.state) })
         outbox.reconcile(with: fates)
         for command in outbox.all {
-            if let old = before[command.id], old != command.state {
-                journal.record(.commandTransition(CommandTransition(id: command.id, from: old, to: command.state)))
+            guard let old = before[command.id], old != command.state else { continue }
+            journal.record(.commandTransition(CommandTransition(id: command.id, from: old, to: command.state)))
+            // A command the snapshot says was acknowledged *was* acknowledged.
+            // Counting only the stream path would make the metric mean "acks
+            // that happened to arrive as events", which is not what it is
+            // called and not what anyone reads it as.
+            if case .acknowledged = command.state {
+                metrics.commandsAcknowledged = Saturating.add(metrics.commandsAcknowledged, 1)
             }
         }
     }
@@ -333,6 +488,11 @@ public actor SessionReplica {
     }
 
     public func transportClosed(reason: String) {
+        // Un-strand anything the dead socket was carrying, before the
+        // supervisor decides to reconnect.
+        for transition in outbox.connectionLost(reason: reason) {
+            journal.record(.commandTransition(transition))
+        }
         supervisor.handle(.transportFailed(now: clock(), reason: reason)).forEach(perform)
         publish()
     }
@@ -356,7 +516,17 @@ public actor SessionReplica {
         switch action {
         case .enterStatusOnly: statusOnly = true
         case .leaveStatusOnly: statusOnly = false
-        case .requestSnapshot: pendingResyncRequest = true
+        case .requestSnapshot:
+            // The supervisor-initiated resync must reach the journal too. If
+            // it did not, the checker's `awaitingSnapshot` flag would never be
+            // set on this path and `.appliedAfterResyncWithoutSnapshot` could
+            // not fire for the most common trigger there is — one of the nine
+            // checks silently dark on the case that matters most.
+            if !pendingResyncRequest {
+                pendingResyncRequest = true
+                metrics.resyncs = Saturating.add(metrics.resyncs, 1)
+                journal.record(.resyncRequested(.supervisorDeclaredStalled))
+            }
         case .resumeFromCursor: break // the driver passes the cursor on `open`
         case .openTransport, .closeTransport: break
         }

@@ -56,7 +56,14 @@ public enum ResyncReason: Hashable, Sendable {
     case gapTooWide(missingFrom: UInt64, sawSequence: UInt64)
     case reorderWindowExhausted(pending: Int)
     case heartbeatShowsLag(behindBy: UInt64)
+    /// Defensive only. Unreachable in practice: it requires a sequence past
+    /// the cursor *and* a cursor already at `UInt64.max`, and the ingestor
+    /// refuses to advance onto the ceiling. It exists so that the impossible
+    /// case degrades into a resync rather than a wrap.
     case sequenceExhausted
+    /// The supervisor, not the ingestor, declared the link unrecoverable —
+    /// heartbeats without content for longer than the policy allows.
+    case supervisorDeclaredStalled
 }
 
 /// What to do with one incoming event.
@@ -104,7 +111,19 @@ public struct EventIngestor: Sendable {
     /// degraded, session stalls" shape — and waiting will not fix it.
     public mutating func observe(heartbeatNewest newest: UInt64, epoch: UInt64) -> ResyncReason? {
         if let reason = awaitingResync { return reason }
-        guard epoch == cursor.epoch else { return nil }
+        // An *older* epoch is a straggler from a connection that has been
+        // superseded: ignore it. A *newer* one is unambiguous proof that the
+        // sequence line restarted, and it is the strongest resync trigger
+        // there is. Treating both as "ignore" is how a replica whose link
+        // stays open sits on a stale transcript reporting itself live —
+        // the stuck-session bug this type exists to prevent.
+        if epoch < cursor.epoch { return nil }
+        if epoch > cursor.epoch {
+            let reason = ResyncReason.epochAdvanced(from: cursor.epoch, to: epoch)
+            awaitingResync = reason
+            pending.removeAll(keepingCapacity: true)
+            return reason
+        }
         let lag = Saturating.subtract(newest, cursor.lastApplied)
         if lag > policy.maxGapWidth && pending.isEmpty {
             let reason = ResyncReason.heartbeatShowsLag(behindBy: lag)

@@ -3,7 +3,15 @@
 /// counts, backoff exponents). Nothing in this module may trap on input.
 ///
 /// Every ceiling is derived from `Int.max` / `UInt64.max` rather than a
-/// hard-coded 64-bit literal, because `Int` is 32-bit on watchOS.
+/// hard-coded 64-bit literal, so the code is correct at either `Int` width —
+/// `Int` is 32-bit on watchOS, where a `9_223_372_036_854_775_807` literal
+/// would not even compile.
+///
+/// To be precise about what is verified: this package declares only iOS and
+/// macOS (the platforms its CI actually builds), so the 32-bit path is
+/// *written* to be correct but is not compiled by CI. The width-agnostic style
+/// costs nothing and removes a whole class of porting bug; it is not a claim
+/// that a 32-bit build has been tested.
 public enum Saturating {
     /// `a + b`, clamped to `Int.max` / `Int.min` instead of overflowing.
     @inlinable

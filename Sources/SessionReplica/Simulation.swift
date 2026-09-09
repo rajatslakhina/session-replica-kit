@@ -158,6 +158,15 @@ public actor ScriptedSessionServer {
                         commandFates: fates)
     }
 
+    /// The snapshot *and* the sequence it was taken at, read in one actor hop.
+    /// Taking these separately is a real bug: a `deliver` landing between the
+    /// two hops appends an event that is absent from the snapshot but below
+    /// the newest sequence, so the caller's "deliver everything after this"
+    /// loop skips it forever.
+    public func snapshotWithNewest() -> (snapshot: SessionSnapshot, newest: UInt64) {
+        (snapshot(), newestSequence)
+    }
+
     /// An attach snapshot: the state at the compaction point, after which the
     /// replayable log is streamed. This is how a relay serves a cursor it
     /// cannot replay from — base image plus log — and it is why a fresh
@@ -321,10 +330,18 @@ public enum ChaosScheduler {
             if random.unit() < policy.duplicateProbability { delivered.append(event) }
         }
         // Reorder within windows.
+        //
+        // `reorderWindow` is a `public var`, so — exactly like `heartbeatEvery`
+        // below — the value clamped in `init` is not an invariant a caller has
+        // to respect. A negative window would make `end < index` and trap on
+        // the range; a zero window would leave `index` unchanged and spin
+        // forever. Re-clamp at the point of use, and saturate the addition so
+        // a window near `Int.max` cannot overflow either.
+        let reorderWindow = max(1, policy.reorderWindow)
         var reordered: [SessionEvent] = []
         var index = 0
         while index < delivered.count {
-            let end = min(delivered.count, index + policy.reorderWindow)
+            let end = min(delivered.count, Saturating.add(index, reorderWindow))
             var window = Array(delivered[index..<end])
             // Fisher–Yates on the window.
             var i = window.count - 1
@@ -460,8 +477,9 @@ public final class ChaosTransport: SessionTransport, @unchecked Sendable {
                     try? await Task.sleep(nanoseconds: 5_000_000)
                 }
                 if let self, self.snapshotRequested(clearing: true) {
-                    continuation.yield(.snapshot(await server.snapshot()))
-                    deliveredThrough = await server.newestSequence
+                    let taken = await server.snapshotWithNewest()
+                    continuation.yield(.snapshot(taken.snapshot))
+                    deliveredThrough = taken.newest
                 }
                 let fresh = await server.log.filter { $0.id.sequence > deliveredThrough }
                 for event in fresh {

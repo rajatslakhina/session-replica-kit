@@ -68,10 +68,19 @@ public struct TranscriptPolicy: Hashable, Sendable {
     /// Hard cap on entries kept in memory. Oldest entries are dropped from the
     /// *front* and the count is reported, never silently.
     public var maxEntries: Int
+    /// Hard cap on the characters in a single coalesced assistant-text entry.
+    ///
+    /// `maxEntries` bounds the *count*, not the memory: a long streaming turn
+    /// with no structural events between deltas coalesces into one entry, and
+    /// that one `String` would otherwise grow without limit — in a library
+    /// whose entire premise is *long-running* sessions. When the cap is hit the
+    /// front of the string is dropped and `charactersElided` reports it.
+    public var maxTextCharacters: Int
 
-    public init(maxOrphanResults: Int = 32, maxEntries: Int = 2_000) {
+    public init(maxOrphanResults: Int = 32, maxEntries: Int = 2_000, maxTextCharacters: Int = 200_000) {
         self.maxOrphanResults = max(0, maxOrphanResults)
         self.maxEntries = max(1, maxEntries)
+        self.maxTextCharacters = max(1, maxTextCharacters)
     }
 
     public static let `default` = TranscriptPolicy()
@@ -85,6 +94,8 @@ public struct TranscriptState: Hashable, Sendable {
     public private(set) var orphanCallIDs: Set<ToolCallID> = []
     public private(set) var droppedFromFront: Int = 0
     public private(set) var orphansDiscarded: Int = 0
+    /// Characters dropped from the front of over-long coalesced text entries.
+    public private(set) var charactersElided: Int = 0
     public let policy: TranscriptPolicy
 
     public init(policy: TranscriptPolicy = .default) {
@@ -94,6 +105,16 @@ public struct TranscriptState: Hashable, Sendable {
     public init(policy: TranscriptPolicy = .default, entries: [TranscriptEntry]) {
         self.policy = policy
         for entry in entries { append(entry) }
+        // `append` rebuilds `callIndex` but knows nothing about orphans, so a
+        // snapshot restored without this loop starts with an empty orphan set:
+        // the budget would then under-count and allow up to twice
+        // `maxOrphanResults`, and two identically-rendered transcripts would
+        // compare unequal because `==` includes `orphanCallIDs`.
+        for entry in self.entries {
+            if case .toolCall(let call) = entry, call.status == .resultBeforeStart {
+                orphanCallIDs.insert(call.callID)
+            }
+        }
     }
 
     public static func == (lhs: TranscriptState, rhs: TranscriptState) -> Bool {
@@ -110,6 +131,18 @@ public struct TranscriptState: Hashable, Sendable {
 
     // MARK: Reduction
 
+    /// Caps one coalesced text entry, dropping from the front so the newest
+    /// text — the part a streaming UI is actually looking at — survives.
+    /// `maxTextCharacters` is a `public var`, so it is re-clamped here rather
+    /// than trusted from `init`.
+    private mutating func elided(_ text: String) -> String {
+        let cap = max(1, policy.maxTextCharacters)
+        guard text.count > cap else { return text }
+        let excess = text.count - cap
+        charactersElided = Saturating.add(charactersElided, excess)
+        return String(text.suffix(cap))
+    }
+
     /// Applies one event that the ingestor has already accepted as in-order.
     public mutating func apply(_ event: SessionEvent) {
         let sequence = event.id.sequence
@@ -124,9 +157,9 @@ public struct TranscriptState: Hashable, Sendable {
         case .textDelta(nil, let text):
             guard !text.isEmpty else { return }
             if let last = entries.indices.last, case .assistantText(let existing) = entries[last] {
-                entries[last] = .assistantText(existing + text)
+                entries[last] = .assistantText(elided(existing + text))
             } else {
-                append(.assistantText(text))
+                append(.assistantText(elided(text)))
             }
 
         case .toolCallStarted(let callID, let name):

@@ -27,6 +27,11 @@ public struct ReplicaJournal: Hashable, Sendable {
     public let capacity: Int
     public private(set) var records: [JournalRecord] = []
     public private(set) var droppedCount: Int = 0
+    /// Bumped on every `record`. Lets a caller cache a validation result and
+    /// invalidate it cheaply, rather than re-scanning the whole ring on every
+    /// published view — which, at up to a dozen publishes a second over a
+    /// 4 096-record journal, is real work to do per UI frame.
+    public private(set) var revision: UInt64 = 0
 
     public init(capacity: Int = 4_096) {
         self.capacity = max(1, capacity)
@@ -34,6 +39,7 @@ public struct ReplicaJournal: Hashable, Sendable {
 
     public mutating func record(_ record: JournalRecord) {
         records.append(record)
+        revision &+= 1
         if records.count > capacity {
             let excess = records.count - capacity
             records.removeFirst(excess)
