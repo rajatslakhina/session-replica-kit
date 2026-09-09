@@ -175,7 +175,28 @@ final class ChaosTests: XCTestCase {
         XCTAssertNotEqual(hostileSequences, cleanSequences, "the hostile policy must actually perturb")
         XCTAssertNotEqual(hostileSequences, hostileSequences.sorted(), "…including reordering")
         XCTAssertTrue(hostile.contains(.disconnect), "…and disconnecting")
-        XCTAssertLessThan(Set(hostileSequences).count, events.count, "…and dropping")
+
+        // Dropping has to be asserted on a schedule that is NOT truncated by the
+        // disconnect, or the missing sequences prove nothing: `.hostile` cuts the
+        // stream at 25 frames, so ~18 of 40 events would be absent even with
+        // `dropProbability` hard-wired to zero.
+        let dropsOnly = ChaosPolicy(dropProbability: 0.3, seed: 42)
+        let dropped = ChaosScheduler.schedule(events, policy: dropsOnly, connectionIndex: 0)
+        XCTAssertFalse(dropped.contains(.disconnect), "this schedule must run to completion")
+        let droppedSequences = Set(dropped.compactMap { frame -> UInt64? in
+            if case .event(let e) = frame { return e.id.sequence }
+            return nil
+        })
+        XCTAssertLessThan(droppedSequences.count, events.count, "…and dropping")
+
+        // And the control's own control: with drops off, nothing is missing.
+        let noDrops = ChaosScheduler.schedule(events, policy: ChaosPolicy(reorderWindow: 4, seed: 42), connectionIndex: 0)
+        let noDropSequences = Set(noDrops.compactMap { frame -> UInt64? in
+            if case .event(let e) = frame { return e.id.sequence }
+            return nil
+        })
+        XCTAssertEqual(noDropSequences.count, events.count,
+                       "reordering alone must not lose events — otherwise the drop assertion above is vacuous")
     }
 
     func testDifferentConnectionsGetDifferentSchedules() {

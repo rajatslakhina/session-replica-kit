@@ -133,20 +133,32 @@ final class IngestorTests: XCTestCase {
 
     // MARK: Negative controls — the ingestor must be the thing under test.
 
-    func testAStubbedIngestorThatAlwaysAppliesWouldFailTheseTests() {
-        // A deliberately broken "ingestor": applies everything, in any order.
-        struct AlwaysApply {
-            var applied: [UInt64] = []
-            mutating func ingest(_ e: SessionEvent) -> [UInt64] { applied.append(e.id.sequence); return [e.id.sequence] }
-        }
-        var broken = AlwaysApply()
-        _ = broken.ingest(ev(1, 1))
-        _ = broken.ingest(ev(1, 1))
-        XCTAssertEqual(broken.applied, [1, 1],
-                       "the broken implementation double-applies — which the real testReplayedEventsAreDuplicates* would catch")
+    /// Runs the *same* mixed schedule — duplicates, a reorder, an old epoch —
+    /// through a deliberately broken "apply everything" ingestor and through
+    /// the real one, and asserts they disagree on every count that matters. If
+    /// `EventIngestor` were ever rewritten to apply blindly, this fails.
+    func testABlindlyApplyingIngestorDisagreesWithTheRealOneOnEveryCount() {
+        let schedule = [ev(1, 1), ev(1, 1), ev(1, 3), ev(1, 2), ev(0, 9), ev(1, 2)]
+
+        // The broken implementation: no cursor, no ordering, no epoch check.
+        var blindlyApplied: [EventID] = []
+        for event in schedule { blindlyApplied.append(event.id) }
 
         var real = attached()
-        _ = real.ingest(ev(1, 1))
-        XCTAssertTrue(real.ingest(ev(1, 1)).isDuplicate)
+        var reallyApplied: [EventID] = []
+        for event in schedule {
+            if case .apply(let released) = real.ingest(event) {
+                reallyApplied.append(contentsOf: released.map(\.id))
+            }
+        }
+
+        XCTAssertEqual(blindlyApplied.count, 6)
+        XCTAssertEqual(reallyApplied.count, 3, "1, then 2 releasing the buffered 3")
+        XCTAssertEqual(reallyApplied.map(\.sequence), [1, 2, 3], "in order, exactly once each")
+        XCTAssertEqual(Set(reallyApplied).count, reallyApplied.count, "no id applied twice")
+        XCTAssertFalse(reallyApplied.contains(EventID(epoch: 0, sequence: 9)),
+                       "the stale-epoch event must never be applied")
+        XCTAssertNotEqual(blindlyApplied, reallyApplied,
+                          "if these ever matched, the ingestor would be applying blindly")
     }
 }

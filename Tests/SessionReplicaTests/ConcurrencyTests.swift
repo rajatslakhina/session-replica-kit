@@ -83,9 +83,30 @@ final class ConcurrencyTests: XCTestCase {
         XCTAssertLessThanOrEqual(view.cursor.lastApplied, UInt64(events.count))
     }
 
-    func testViewStreamNeverBlocksAProducer() async {
-        // The published view stream buffers the newest value only, so a UI
-        // that never reads cannot apply backpressure to the network path.
+    /// The published view stream is `.bufferingNewest(1)`: an unread consumer
+    /// must see the *newest* view, never a backlog, and must never apply
+    /// backpressure to the network path.
+    ///
+    /// Asserting only "ingestion didn't hang" would pass for `.unbounded` too,
+    /// so this asserts the buffering policy by its two observable differences:
+    /// `yield` reports `.dropped` once the one slot is full, and an unread
+    /// consumer then sees only the newest value.
+    func testViewStreamConflatesRatherThanQueueing() async {
+        let (stream, continuation) = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        var dropped = 0
+        for i in 0..<5 {
+            if case .dropped = continuation.yield(i) { dropped += 1 }
+        }
+        XCTAssertEqual(dropped, 4,
+                       "with one slot, four of five yields evict — under .unbounded none would")
+        continuation.finish()
+        var received: [Int] = []
+        for await value in stream { received.append(value) }
+        XCTAssertEqual(received, [4],
+                       "an unread consumer sees only the newest view — under .unbounded this would be [0,1,2,3,4]")
+    }
+
+    func testAnUnreadViewStreamNeverStallsIngestion() async {
         let replica = self.replica()
         await replica.receive(snapshot: SessionSnapshot(cursor: EventID(epoch: 1, sequence: 0),
                                                         state: AuthoritativeState(), transcript: []))
@@ -94,7 +115,7 @@ final class ConcurrencyTests: XCTestCase {
         let start = ContinuousClock.now
         for event in events { await replica.receive(event) }
         let elapsed = start.duration(to: ContinuousClock.now)
-        XCTAssertLessThan(elapsed, .seconds(10), "an unread view stream must not stall ingestion")
+        XCTAssertLessThan(elapsed, .seconds(5), "an unread view stream must not stall ingestion")
         let view = await replica.view
         XCTAssertEqual(view.metrics.eventsApplied, events.count)
     }

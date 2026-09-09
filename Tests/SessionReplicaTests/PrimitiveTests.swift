@@ -35,7 +35,11 @@ final class PrimitiveTests: XCTestCase {
         XCTAssertEqual(Saturating.powerOfTwo(0), 1)
         XCTAssertEqual(Saturating.powerOfTwo(10), 1_024)
         XCTAssertEqual(Saturating.powerOfTwo(62), UInt64(1) << 62)
-        XCTAssertEqual(Saturating.powerOfTwo(63), UInt64.max, "a 63+ shift would be a silent zero — the wrong backoff")
+        XCTAssertEqual(Saturating.powerOfTwo(63), UInt64(1) << 63, "2^63 is representable; do not saturate early")
+        // 64 is the first exponent a `UInt64` cannot represent. Swift's smart
+        // shift yields a silent *zero* there, which would turn a long backoff
+        // into "retry immediately" — the opposite of what a dead link needs.
+        XCTAssertEqual(Saturating.powerOfTwo(64), UInt64.max)
         XCTAssertEqual(Saturating.powerOfTwo(Int.max), UInt64.max)
         XCTAssertEqual(Saturating.powerOfTwo(-3), 1)
     }
@@ -70,16 +74,55 @@ final class PrimitiveTests: XCTestCase {
         XCTAssertEqual(Saturating.clamp(5, to: 0...10), 5)
     }
 
-    /// Negative control: the naive implementations these helpers replace do
-    /// trap or silently misbehave. This documents *why* each helper exists.
+    /// Negative control: run the *naive* expression each helper replaces and
+    /// assert it gives a different, wrong answer. If a helper were rewritten to
+    /// match the naive form, these fail.
     func testNaiveArithmeticWouldBeWrongWhereTheHelpersAreRight() {
-        // A raw `1 << 63` on UInt64 is representable, but `1 << 64` is a
-        // silent zero — "retry immediately" instead of "back off forever".
-        let naiveShift = UInt64(64) < UInt64(UInt64.bitWidth) ? UInt64(1) << UInt64(63) : 0
-        XCTAssertNotEqual(naiveShift, Saturating.powerOfTwo(63),
-                          "the helper saturates to UInt64.max where the naive shift gives 2^63")
+        // Swift's smart shift yields a silent ZERO once the shift reaches the
+        // type's width — "retry immediately" instead of "back off forever".
+        // Computed for real, not behind a constant-false branch.
+        func naiveShift(_ exponent: Int) -> UInt64 {
+            var value: UInt64 = 1
+            for _ in 0..<exponent { value = value << 1 }
+            return value
+        }
+        XCTAssertEqual(naiveShift(64), 0, "this is the bug the helper exists to avoid")
+        XCTAssertEqual(Saturating.powerOfTwo(64), UInt64.max)
+        XCTAssertNotEqual(naiveShift(64), Saturating.powerOfTwo(64),
+                          "the helper must not reproduce the naive silent zero")
+        // …and it must not over-correct either: below the width they agree.
+        XCTAssertEqual(naiveShift(63), Saturating.powerOfTwo(63))
+
         // `Int(Double.nan)` traps; the helper returns the fallback instead.
         XCTAssertEqual(Saturating.int(from: .nan, fallback: 7), 7)
+    }
+
+    /// The policy structs clamp in `init`, but every field is a `public var`,
+    /// so a caller can put them back out of range. Nothing may trap.
+    func testMutatedPoliciesCannotTrapAtPointOfUse() {
+        var chaos = ChaosPolicy(heartbeatEvery: 4)
+        chaos.heartbeatEvery = 0                     // would trap on `% 0`
+        chaos.stallHeartbeats = -1
+        let events = (1...8).map { ev(1, UInt64($0)) }
+        XCTAssertFalse(ChaosScheduler.schedule(events, policy: chaos, connectionIndex: 1).isEmpty)
+
+        var transcriptPolicy = TranscriptPolicy(maxOrphanResults: 4, maxEntries: 4)
+        transcriptPolicy.maxEntries = -5             // would trip `removeFirst`
+        transcriptPolicy.maxOrphanResults = -2
+        var transcript = TranscriptState(policy: transcriptPolicy)
+        for i in 1...6 { transcript.apply(text(1, UInt64(i), "x\(i)")) }
+        XCTAssertGreaterThanOrEqual(transcript.entries.count, 1)
+
+        var outboxPolicy = OutboxPolicy(capacity: 4, historyLimit: 2, maxAttempts: 2)
+        outboxPolicy.historyLimit = -3
+        var outbox = CommandOutbox(policy: outboxPolicy)
+        for i in 0..<4 {
+            let id = CommandID("c\(i)")
+            _ = outbox.enqueue(.stop, id: id)
+            _ = outbox.markInFlight(id)
+            _ = outbox.acknowledge(id, accepted: true)
+        }
+        XCTAssertGreaterThan(outbox.historyEvicted, 0, "eviction must be counted, not silent")
     }
 
     // MARK: Event sizing

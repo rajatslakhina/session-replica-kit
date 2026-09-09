@@ -140,17 +140,57 @@ final class InvariantTests: XCTestCase {
         XCTAssertTrue(report.passed, "violations: \(report.violations)")
     }
 
-    func testADroppedPrefixWithholdsOnlyTheJudgementsItCouldFalsify() {
-        // Capacity 3: the front is dropped, so the checker cannot know whether
-        // sequence 9 was applied earlier. It must not claim a violation.
+    /// The `duplicateWasNeverApplied` half of the withholding claim. The event
+    /// dropped as a duplicate is *ahead of* the surviving window's cursor, so
+    /// without the `!prefixDropped` guard this journal WOULD be flagged — which
+    /// is what makes the test discriminating rather than incidental.
+    func testADroppedPrefixWithholdsTheDuplicateJudgement() {
         var ring = ReplicaJournal(capacity: 3)
         for seq in UInt64(1)...6 { ring.record(.applied(EventID(epoch: 1, sequence: seq))) }
-        ring.record(.duplicateDropped(EventID(epoch: 1, sequence: 2)))
+        // 9 > the window's last applied (6) and is absent from the survivors,
+        // so it satisfies every other clause of the violation.
+        ring.record(.duplicateDropped(EventID(epoch: 1, sequence: 9)))
         let report = ReplicaInvariants.validate(ring)
         XCTAssertTrue(ring.hasDroppedPrefix)
         XCTAssertFalse(report.withheld.isEmpty)
-        XCTAssertFalse(report.violations.contains(.duplicateWasNeverApplied(EventID(epoch: 1, sequence: 2))))
+        XCTAssertFalse(report.violations.contains(.duplicateWasNeverApplied(EventID(epoch: 1, sequence: 9))),
+                       "a dropped prefix means the checker cannot know 9 was never applied")
         XCTAssertTrue(report.passed, "a wrapped ring must not manufacture violations: \(report.violations)")
+
+        // Control: the SAME shape on an intact journal IS flagged. Without this,
+        // the assertion above would pass for a checker that never flags anything.
+        var intact = ReplicaJournal(capacity: 4_096)
+        intact.record(.snapshotApplied(cursor: EventID(epoch: 1, sequence: 0)))
+        for seq in UInt64(1)...6 { intact.record(.applied(EventID(epoch: 1, sequence: seq))) }
+        intact.record(.duplicateDropped(EventID(epoch: 1, sequence: 9)))
+        XCTAssertTrue(ReplicaInvariants.validate(intact).violations
+            .contains(.duplicateWasNeverApplied(EventID(epoch: 1, sequence: 9))))
+    }
+
+    /// The `appliedTwice` half of the same claim: a repeated id *inside* the
+    /// surviving window is not reported once the prefix is gone, because the
+    /// checker clears its applied-set on every re-anchor and cannot distinguish
+    /// a genuine double-apply from a legitimate post-snapshot replay it did not
+    /// see. The out-of-order violation it CAN still derive is reported.
+    func testADroppedPrefixWithholdsTheDoubleApplyJudgement() {
+        var ring = ReplicaJournal(capacity: 3)
+        for seq in UInt64(1)...6 { ring.record(.applied(EventID(epoch: 1, sequence: seq))) }
+        ring.record(.applied(EventID(epoch: 1, sequence: 6)))
+        let report = ReplicaInvariants.validate(ring)
+        XCTAssertTrue(ring.hasDroppedPrefix)
+        XCTAssertFalse(report.violations.contains(.appliedTwice(EventID(epoch: 1, sequence: 6))),
+                       "withheld: the checker cannot see whether a snapshot re-anchored here")
+        XCTAssertTrue(report.violations.contains(
+            .appliedOutOfOrder(previous: EventID(epoch: 1, sequence: 6), next: EventID(epoch: 1, sequence: 6))),
+                      "…but ordering is still derivable from the surviving window and must be reported")
+
+        // Control: intact, the same repeat IS reported as a double-apply.
+        var intact = ReplicaJournal(capacity: 4_096)
+        intact.record(.snapshotApplied(cursor: EventID(epoch: 1, sequence: 5)))
+        intact.record(.applied(EventID(epoch: 1, sequence: 6)))
+        intact.record(.applied(EventID(epoch: 1, sequence: 6)))
+        XCTAssertTrue(ReplicaInvariants.validate(intact).violations
+            .contains(.appliedTwice(EventID(epoch: 1, sequence: 6))))
     }
 
     func testADroppedPrefixStillCatchesOrderingViolations() {
