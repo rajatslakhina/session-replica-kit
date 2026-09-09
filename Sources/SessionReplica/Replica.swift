@@ -46,6 +46,13 @@ final class ViewObservers: @unchecked Sendable {
         return continuations.count
     }
 
+    deinit {
+        // Dropping the last continuation does *not* finish an `AsyncStream`, so
+        // without this a consumer sitting in `for await view in replica.views`
+        // would hang forever once the replica is deallocated.
+        finish()
+    }
+
     func makeStream() -> AsyncStream<ReplicaView> {
         let (stream, continuation) = AsyncStream<ReplicaView>.makeStream(bufferingPolicy: .bufferingNewest(1))
 
@@ -58,7 +65,16 @@ final class ViewObservers: @unchecked Sendable {
         let token = nextToken
         nextToken = Saturating.add(nextToken, 1)
         continuations[token] = continuation
-        let current = latest
+        // Seed the new observer *inside* the lock so it renders immediately.
+        //
+        // Seeding after unlocking would be a real ordering bug: a concurrent
+        // `publish` could set `latest` and yield the newer view into this
+        // brand-new one-slot buffer, and the stale seed would then evict it —
+        // leaving the observer a publish behind, which on an idle link may be
+        // where it stays. Yielding here is safe precisely because the stream
+        // has not been handed to anyone yet: no consumer can be suspended on
+        // it, so `yield` can only buffer and cannot re-enter this lock.
+        if let current = latest { _ = continuation.yield(current) }
         lock.unlock()
 
         continuation.onTermination = { [weak self] _ in
@@ -67,8 +83,6 @@ final class ViewObservers: @unchecked Sendable {
             self.continuations.removeValue(forKey: token)
             self.lock.unlock()
         }
-        // Seed the new observer so it renders immediately.
-        if let current { _ = continuation.yield(current) }
         return stream
     }
 
@@ -517,19 +531,43 @@ public actor SessionReplica {
         case .enterStatusOnly: statusOnly = true
         case .leaveStatusOnly: statusOnly = false
         case .requestSnapshot:
-            // The supervisor-initiated resync must reach the journal too. If
-            // it did not, the checker's `awaitingSnapshot` flag would never be
-            // set on this path and `.appliedAfterResyncWithoutSnapshot` could
-            // not fire for the most common trigger there is — one of the nine
-            // checks silently dark on the case that matters most.
-            if !pendingResyncRequest {
+            // The supervisor-initiated resync must reach the journal too, or
+            // `.appliedAfterResyncWithoutSnapshot` is dark on this trigger.
+            //
+            // But journalling it is only honest if the ingestor is *actually*
+            // latched: the checker reads nothing but the journal, so a record
+            // saying "a resync was requested" while events keep applying makes
+            // the checker report FAIL for a replica that did nothing wrong —
+            // and a degraded link flushing its backlog before the snapshot
+            // arrives is the ordinary case, not an exotic one. So latch first,
+            // and journal only if the latch actually took hold.
+            if !pendingResyncRequest, ingestor.requireResync(.supervisorDeclaredStalled) {
                 pendingResyncRequest = true
                 metrics.resyncs = Saturating.add(metrics.resyncs, 1)
                 journal.record(.resyncRequested(.supervisorDeclaredStalled))
+            } else {
+                pendingResyncRequest = true
             }
         case .resumeFromCursor: break // the driver passes the cursor on `open`
         case .openTransport, .closeTransport: break
         }
+    }
+
+    // MARK: - Test seams
+
+    /// Drives the supervisor's `.requestSnapshot` action directly. Reaching it
+    /// through a real stall takes seconds of wall-clock time and depends on
+    /// the transport's pacing; the property under test is what the *replica*
+    /// does with the action, not how long the supervisor takes to emit it.
+    func declareStalledForTesting() {
+        perform(.requestSnapshot)
+    }
+
+    /// Appends a record to the journal without going through the state
+    /// machine, so a test can prove the memoised invariant report is
+    /// invalidated rather than merely that it was right once.
+    func journalForTesting(_ record: JournalRecord) {
+        journal.record(record)
     }
 
     // MARK: - Driver

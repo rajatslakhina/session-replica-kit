@@ -140,8 +140,11 @@ public struct CommandOutbox: Hashable, Sendable {
     @discardableResult
     public mutating func enqueue(_ kind: CommandKind, id: CommandID) -> Result<OutboundCommand, OutboxError> {
         if commands[id] != nil { return .failure(.duplicateID(id)) }
-        if pendingCount >= policy.capacity { return .failure(.full(capacity: policy.capacity)) }
-        guard nextOrdinal < UInt64.max else { return .failure(.full(capacity: policy.capacity)) }
+        // `capacity` is a `public var`; re-clamp rather than trust it. A zero
+        // or negative capacity would otherwise refuse every enqueue silently.
+        let capacity = max(1, policy.capacity)
+        if pendingCount >= capacity { return .failure(.full(capacity: capacity)) }
+        guard nextOrdinal < UInt64.max else { return .failure(.full(capacity: capacity)) }
         let command = OutboundCommand(id: id, kind: kind, ordinal: nextOrdinal)
         nextOrdinal += 1
         commands[id] = command
@@ -158,21 +161,32 @@ public struct CommandOutbox: Hashable, Sendable {
     /// `.queued`, so without this the command sits forever in a non-terminal
     /// state and the retry story is a fiction.
     ///
-    /// Commands that exhausted their attempts fail instead of looping, and
-    /// `.parkedAtRelay` is deliberately *left alone* — the relay has it and
-    /// will forward it when the machine comes back, so re-sending would be
-    /// wrong even though the socket is gone.
+    /// Stranded commands go back to `.queued` **unconditionally** — a dead
+    /// socket is not evidence about the command, so failing it here would be
+    /// a verdict the transport never delivered. It would also be a verdict
+    /// nothing can overturn: `reconcile` only touches non-terminal commands,
+    /// so a snapshot saying the agent *did* acknowledge it would be ignored,
+    /// and the UI would show "failed" forever for a command that succeeded.
+    /// Keeping it non-terminal is what preserves "server wins".
+    ///
+    /// Retries stay bounded without a verdict here: `markInFlight` counts an
+    /// attempt on every real send, `apply(.failed:)` closes the command once
+    /// those are exhausted, and a link that keeps dying drives the
+    /// *supervisor* to `.suspended` after its own `maxAttempts`, which stops
+    /// the loop at the level where the failure actually is.
+    ///
+    /// `.parkedAtRelay` is deliberately left alone: the relay is durable and
+    /// still holds the command, so re-sending would duplicate work the socket's
+    /// death says nothing about. `.forwardedToMachine` is not exempt, because
+    /// the machine may have died with the link.
     @discardableResult
     public mutating func connectionLost(reason: String) -> [CommandTransition] {
         var applied: [CommandTransition] = []
         for command in all where command.state == .inFlight || command.state == .forwardedToMachine {
             let from = command.state
-            let target: CommandState = command.attempts < policy.maxAttempts
-                ? .queued
-                : .failed(reason: reason)
-            if case .success = transition(command.id, to: target,
+            if case .success = transition(command.id, to: .queued,
                                           allowedFrom: [.inFlight, .forwardedToMachine]) {
-                applied.append(CommandTransition(id: command.id, from: from, to: target))
+                applied.append(CommandTransition(id: command.id, from: from, to: .queued))
             }
         }
         return applied
@@ -189,7 +203,10 @@ public struct CommandOutbox: Hashable, Sendable {
                               allowedFrom: [.inFlight, .parkedAtRelay])
         case .failed(let reason):
             guard let command = commands[id] else { return .failure(.unknownCommand(id)) }
-            if command.attempts < policy.maxAttempts {
+            // `maxAttempts` is a `public var` too: a zero would fail every
+            // command on its first hiccup, which is a behaviour change rather
+            // than a trap, but the clamp keeps the field's meaning honest.
+            if command.attempts < max(1, policy.maxAttempts) {
                 // Back to the queue with the same id: the server deduplicates
                 // by id, so a retry cannot double-apply.
                 return transition(id, to: .queued, allowedFrom: [.inFlight, .parkedAtRelay, .forwardedToMachine])

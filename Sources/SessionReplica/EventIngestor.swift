@@ -97,6 +97,23 @@ public struct EventIngestor: Sendable {
 
     public var pendingCount: Int { pending.count }
 
+    /// Latches the ingestor into "refuse everything until a snapshot" for a
+    /// reason the ingestor could not have detected itself — the supervisor
+    /// declaring the link unrecoverable, for instance.
+    ///
+    /// This exists so that a *journalled* resync request is always true of the
+    /// ingestor. A caller that records "a resync was requested" while the
+    /// ingestor keeps applying events makes the journal lie, and the
+    /// independent checker — which reads only the journal — then reports FAIL
+    /// for a replica that did nothing wrong.
+    @discardableResult
+    public mutating func requireResync(_ reason: ResyncReason) -> Bool {
+        guard awaitingResync == nil else { return false }
+        awaitingResync = reason
+        pending.removeAll(keepingCapacity: true)
+        return true
+    }
+
     /// Re-anchors the cursor from a snapshot. Anything buffered belongs to the
     /// old line and is discarded; the snapshot's transcript supersedes it.
     public mutating func apply(snapshot: SessionSnapshot) {

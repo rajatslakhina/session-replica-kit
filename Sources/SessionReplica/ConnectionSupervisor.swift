@@ -20,6 +20,14 @@ public typealias Millis = UInt64
 
 public struct SupervisorPolicy: Hashable, Sendable {
     /// Expected interval between server heartbeats.
+    ///
+    /// Declared but **not read by the supervisor**: liveness is decided from
+    /// observed arrival times against `deadAfter` and `stalledAfter`, not from
+    /// an expectation the server may not honour. It is kept because those two
+    /// are meaningless to choose without it — a sane configuration is a few
+    /// multiples of this — and stating the cadence next to the timeouts it
+    /// sizes is more useful than a comment somewhere else. It is documented as
+    /// unread rather than quietly implying it does something.
     public var heartbeatInterval: Millis
     /// No heartbeat for this long → the transport is dead; reconnect.
     public var deadAfter: Millis
