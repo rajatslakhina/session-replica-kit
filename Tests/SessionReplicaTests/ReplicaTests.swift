@@ -163,4 +163,94 @@ final class ReplicaTests: XCTestCase {
         let view = await replica().view
         XCTAssertEqual(view.metrics.applyRatio, 0, "no division by zero on a fresh replica")
     }
+
+    /// `applyRatio`'s denominator must exclude heartbeats. An idle link emits
+    /// them forever, so a ratio that counted them would decay towards zero
+    /// with wall-clock time on a *perfectly correct* replica — the number
+    /// would be reporting elapsed time, not correctness.
+    func testApplyRatioIgnoresHeartbeats() async {
+        let replica = self.replica()
+        await replica.receive(snapshot: snapshot())
+        let events = SessionScript.turn(epoch: 1, parallelCalls: 1, textTokens: 6)
+        for event in events { await replica.receive(event) }
+        let clean = await replica.view.metrics
+        XCTAssertEqual(clean.applyRatio, 1.0, accuracy: 0.0001, "a clean link applies everything it receives")
+
+        for i in 0..<50 {
+            await replica.receive(SessionEvent(epoch: 1, sequence: UInt64(i), .heartbeat(newestSequence: UInt64(events.count))))
+        }
+        let afterIdling = await replica.view.metrics
+        XCTAssertEqual(afterIdling.applyRatio, 1.0, accuracy: 0.0001,
+                       "50 heartbeats must not move the ratio")
+        XCTAssertGreaterThan(afterIdling.eventsReceived, afterIdling.contentReceived,
+                             "…and the two counters must genuinely differ, or the assertion above is vacuous")
+    }
+
+    /// A replayed acknowledgement is legitimate: a snapshot closes a command,
+    /// then the resume replays the ack that closed it. The outbox absorbs it
+    /// idempotently — but if the replica journals that no-op as a transition,
+    /// it writes `acknowledged → acknowledged`, and the independent checker
+    /// correctly reports FAIL for a replica that did nothing wrong.
+    func testAReplayedAcknowledgementDoesNotFalsifyTheInvariantVerdict() async {
+        let replica = self.replica()
+        let id = CommandID("stop-1")
+        await replica.receive(snapshot: snapshot())
+        await replica.enqueue(.stop, id: id)
+        _ = await replica.dequeueForDelivery()
+
+        // The snapshot says the server already acknowledged it.
+        await replica.receive(snapshot: snapshot(sequence: 5, fates: [id: .acknowledged(accepted: true)]))
+        let closed = await replica.view
+        XCTAssertTrue(closed.invariants.passed, "violations: \(closed.invariants.violations)")
+
+        // Now the resume replays the ack event for that same command.
+        await replica.receive(SessionEvent(epoch: 1, sequence: 6, .commandAcknowledged(id, accepted: true)))
+        let after = await replica.view
+        XCTAssertTrue(after.invariants.passed,
+                      "a replayed ack must not manufacture a terminal→terminal edge: \(after.invariants.violations)")
+        XCTAssertEqual(after.metrics.commandsAcknowledged, 1, "…and must not double-count")
+    }
+
+    /// The link dies with a command in flight. `nextToSend` only picks
+    /// `.queued`, and a dead socket never reports, so without an explicit
+    /// re-queue the command is stranded in a non-terminal state forever and
+    /// the retry story is a fiction.
+    func testACommandInFlightWhenTheLinkDiesIsRequeued() async {
+        let replica = self.replica(ReplicaConfiguration(outbox: OutboxPolicy(capacity: 4, historyLimit: 8, maxAttempts: 3)))
+        let id = CommandID("stop-1")
+        await replica.receive(snapshot: snapshot())
+        await replica.enqueue(.stop, id: id)
+        let sent = await replica.dequeueForDelivery()
+        XCTAssertEqual(sent?.id, id)
+        let inFlight = await replica.view.outbox.first?.state
+        XCTAssertEqual(inFlight, .inFlight)
+
+        await replica.transportClosed(reason: "connection dropped")
+
+        let view = await replica.view
+        XCTAssertEqual(view.outbox.first?.state, .queued, "a stranded command must return to the queue")
+        XCTAssertTrue(view.invariants.passed, "violations: \(view.invariants.violations)")
+        // And it is genuinely sendable again — not merely relabelled.
+        let resent = await replica.dequeueForDelivery()
+        XCTAssertEqual(resent?.id, id, "the same id is retried; the server deduplicates")
+    }
+
+    /// The other half: a command that has exhausted its attempts must fail
+    /// rather than loop forever. Without this the fix above would be an
+    /// infinite retry machine.
+    func testAStrandedCommandOutOfAttemptsFailsInsteadOfLooping() async {
+        let replica = self.replica(ReplicaConfiguration(outbox: OutboxPolicy(capacity: 4, historyLimit: 8, maxAttempts: 1)))
+        let id = CommandID("stop-1")
+        await replica.receive(snapshot: snapshot())
+        await replica.enqueue(.stop, id: id)
+        _ = await replica.dequeueForDelivery()
+        await replica.transportClosed(reason: "connection dropped")
+
+        let view = await replica.view
+        guard case .failed = view.outbox.first?.state else {
+            return XCTFail("expected .failed, got \(String(describing: view.outbox.first?.state))")
+        }
+        let retried = await replica.dequeueForDelivery()
+        XCTAssertNil(retried, "a failed command must not be re-sent")
+    }
 }

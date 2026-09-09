@@ -119,9 +119,37 @@ final class IngestorTests: XCTestCase {
         XCTAssertEqual(behind, 90)
     }
 
-    func testHeartbeatFromAnotherEpochIsIgnored() {
-        var ingestor = attached(1, 10)
-        XCTAssertNil(ingestor.observe(heartbeatNewest: 10_000, epoch: 9))
+    func testHeartbeatFromAnOlderEpochIsIgnored() {
+        var ingestor = attached(5, 10)
+        XCTAssertNil(ingestor.observe(heartbeatNewest: 10_000, epoch: 2),
+                     "a straggler from a superseded connection proves nothing")
+        XCTAssertEqual(ingestor.cursor.epoch, 5)
+    }
+
+    /// A *newer* epoch on a heartbeat is unambiguous proof the sequence line
+    /// restarted. Ignoring it — as "any epoch mismatch is noise" would — is
+    /// how a replica whose link stays open sits on a stale transcript
+    /// reporting itself live, with no mechanism to ever notice.
+    func testHeartbeatFromANewerEpochForcesResyncWithoutAnyContent() {
+        var ingestor = attached(1, 10, policy: IngestPolicy(maxReorderWindow: 8, maxGapWidth: 10_000))
+        // Deliberately a *small* newest: the lag rule cannot fire here, so a
+        // resync can only come from the epoch check itself.
+        guard case .epochAdvanced(let from, let to)? = ingestor.observe(heartbeatNewest: 3, epoch: 2) else {
+            return XCTFail("a newer epoch on a heartbeat must force a resync")
+        }
+        XCTAssertEqual(from, 1)
+        XCTAssertEqual(to, 2)
+        XCTAssertNotNil(ingestor.awaitingResync)
+        // And the latch holds: nothing is applied until a snapshot lands.
+        XCTAssertNotNil(ingestor.ingest(ev(2, 1)).resyncReason)
+    }
+
+    func testHeartbeatOnTheSameEpochWithNoLagStillDoesNothing() {
+        // Control for the test above: same shape, same small `newest`, same
+        // wide gap policy — only the epoch differs. If this returned a reason
+        // too, the test above would be proving nothing about epochs.
+        var ingestor = attached(1, 10, policy: IngestPolicy(maxReorderWindow: 8, maxGapWidth: 10_000))
+        XCTAssertNil(ingestor.observe(heartbeatNewest: 3, epoch: 1))
     }
 
     func testHeartbeatWithPendingEventsDoesNotResync() {

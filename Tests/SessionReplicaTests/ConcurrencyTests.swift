@@ -83,27 +83,93 @@ final class ConcurrencyTests: XCTestCase {
         XCTAssertLessThanOrEqual(view.cursor.lastApplied, UInt64(events.count))
     }
 
-    /// The published view stream is `.bufferingNewest(1)`: an unread consumer
-    /// must see the *newest* view, never a backlog, and must never apply
-    /// backpressure to the network path.
+    /// `SessionReplica`'s *own* published stream is `.bufferingNewest(1)`: a
+    /// consumer that stops reading must see the newest view when it comes
+    /// back, never a backlog, and must never apply backpressure to the
+    /// network path.
     ///
-    /// Asserting only "ingestion didn't hang" would pass for `.unbounded` too,
-    /// so this asserts the buffering policy by its two observable differences:
-    /// `yield` reports `.dropped` once the one slot is full, and an unread
-    /// consumer then sees only the newest value.
-    func testViewStreamConflatesRatherThanQueueing() async {
-        let (stream, continuation) = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        var dropped = 0
-        for i in 0..<5 {
-            if case .dropped = continuation.yield(i) { dropped += 1 }
+    /// This has to be asserted against the replica, not against a locally
+    /// constructed `AsyncStream` — a test that builds its own stream and
+    /// checks `.bufferingNewest(1)` behaves like `.bufferingNewest(1)` is
+    /// testing the standard library, and would stay green if `Replica.swift`
+    /// switched to `.unbounded`.
+    ///
+    /// Both assertions below discriminate:
+    ///   - `viewsDropped > 0` is only reachable when a yield evicts an unread
+    ///     value, which `.unbounded` never does.
+    ///   - the first value a returning consumer reads is the *newest*; under
+    ///     `.unbounded` it would be the oldest (`eventsApplied == 0`).
+    func testTheReplicaViewStreamConflatesRatherThanQueueing() async {
+        let replica = self.replica()
+        let stream = replica.views                    // subscribe, then do not read
+        var iterator = stream.makeAsyncIterator()
+
+        await replica.receive(snapshot: SessionSnapshot(cursor: EventID(epoch: 1, sequence: 0),
+                                                        state: AuthoritativeState(), transcript: []))
+        // The subscribe-time seed plus the snapshot publish already fill and
+        // evict the single slot; the turn below adds many more publishes.
+        let events = SessionScript.turn(epoch: 1, parallelCalls: 3, textTokens: 40)
+        for event in events { await replica.receive(event) }
+        await replica.tick()
+
+        let metrics = await replica.view.metrics
+        XCTAssertGreaterThan(metrics.publishes, 1,
+                             "the test is only meaningful if more than one view was published")
+        XCTAssertGreaterThan(metrics.viewsDropped, 0,
+                             "an unread one-slot buffer must evict — under .unbounded nothing would")
+
+        let first = await iterator.next()
+        XCTAssertEqual(first?.metrics.eventsApplied, events.count,
+                       "a consumer that comes back sees the NEWEST view; under .unbounded it would see the first")
+    }
+
+    /// Two observers at once. `AsyncStream` allows exactly one iterator, so a
+    /// single shared stream would trap here rather than fail — which is the
+    /// whole reason `views` vends a fresh stream per call.
+    func testTwoObserversBothReceiveViews() async {
+        let replica = self.replica()
+        let a = replica.views
+        let b = replica.views
+        var itA = a.makeAsyncIterator()
+        var itB = b.makeAsyncIterator()
+
+        await replica.receive(snapshot: SessionSnapshot(cursor: EventID(epoch: 1, sequence: 0),
+                                                        state: AuthoritativeState(), transcript: []))
+        for event in SessionScript.turn(epoch: 1, parallelCalls: 1, textTokens: 6) {
+            await replica.receive(event)
         }
-        XCTAssertEqual(dropped, 4,
-                       "with one slot, four of five yields evict — under .unbounded none would")
-        continuation.finish()
-        var received: [Int] = []
-        for await value in stream { received.append(value) }
-        XCTAssertEqual(received, [4],
-                       "an unread consumer sees only the newest view — under .unbounded this would be [0,1,2,3,4]")
+        await replica.tick()
+
+        let seenA = await itA.next()
+        let seenB = await itB.next()
+        XCTAssertNotNil(seenA)
+        XCTAssertNotNil(seenB)
+        XCTAssertEqual(seenA?.cursor, seenB?.cursor,
+                       "independent streams, same newest view")
+    }
+
+    /// Cancelling one observer must not silence the others. With a single
+    /// shared `AsyncStream` this is impossible: finishing it once finishes it
+    /// for everyone, and the UI freezes on its last frame.
+    func testCancellingOneObserverLeavesTheOthersRunning() async {
+        let replica = self.replica()
+        await replica.receive(snapshot: SessionSnapshot(cursor: EventID(epoch: 1, sequence: 0),
+                                                        state: AuthoritativeState(), transcript: []))
+
+        let doomed = Task { for await _ in replica.views { } }
+        await Task.yield()
+        doomed.cancel()
+        await doomed.value
+
+        let survivor = replica.views
+        var iterator = survivor.makeAsyncIterator()
+        for event in SessionScript.turn(epoch: 1, parallelCalls: 1, textTokens: 8) {
+            await replica.receive(event)
+        }
+        await replica.tick()
+        let seen = await iterator.next()
+        XCTAssertNotNil(seen, "a surviving observer must still receive views")
+        XCTAssertGreaterThan(seen?.metrics.publishes ?? 0, 0)
     }
 
     func testAnUnreadViewStreamNeverStallsIngestion() async {

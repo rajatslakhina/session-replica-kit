@@ -136,6 +136,57 @@ final class ChaosTests: XCTestCase {
         XCTAssertTrue(view.invariants.passed, "violations: \(view.invariants.violations)")
     }
 
+    /// The epoch changes while the connection *stays open*. Every other epoch
+    /// test closes the transport immediately after `bumpEpoch()`, so the
+    /// reconnect does the work and this path is never exercised — which is how
+    /// a replica that ignores newer-epoch heartbeats can sit on a stale
+    /// transcript reporting itself live, with a green test suite.
+    ///
+    /// Convergence alone is **not** the assertion here, and asserting only that
+    /// would be vacuous: the supervisor's stall detector eventually requests a
+    /// snapshot too, so the replica recovers either way and this test passes
+    /// against an ingestor that ignores the epoch entirely. What distinguishes
+    /// the two is *why* it resynced, so that is what is asserted — the journal
+    /// must contain an `epochAdvanced` request, not merely a stall.
+    func testEpochChangeWithoutADisconnectStillConverges() async {
+        let server = ScriptedSessionServer(epoch: 1, events: SessionScript.turn(epoch: 1, parallelCalls: 1, textTokens: 8))
+        let transport = ChaosTransport(server: server, policy: .clean, pacing: 1)
+        let replica = makeReplica(fastConfiguration())
+        let task = Task { await replica.run(transport: transport, tickEvery: 10) }
+        defer { task.cancel(); transport.close() }
+
+        let firstEpoch = await server.canonicalTranscript.fingerprint
+        let onFirst = await waitUntil(timeoutMillis: 10_000) {
+            await replica.view.transcript.fingerprint == firstEpoch
+        }
+        XCTAssertTrue(onFirst, "did not converge on epoch 1")
+
+        // Teleport, and deliberately do NOT close the link. The only signal
+        // the replica gets is heartbeats carrying the new epoch.
+        await server.bumpEpoch()
+
+        // The discriminating wait: an `epochAdvanced` request must appear in
+        // the journal. Waiting on convergence instead would also be satisfied
+        // by the supervisor's stall path.
+        let noticedTheEpoch = await waitUntil(timeoutMillis: 15_000) {
+            await replica.journalSnapshot.records.contains { record in
+                if case .resyncRequested(.epochAdvanced) = record { return true }
+                return false
+            }
+        }
+        XCTAssertTrue(noticedTheEpoch,
+                      "the epoch change must be recognised from heartbeats, not merely survived via the stall detector")
+
+        let expected = await server.canonicalTranscript.fingerprint
+        let converged = await waitUntil(timeoutMillis: 15_000) {
+            await replica.view.transcript.fingerprint == expected
+        }
+        let view = await replica.view
+        XCTAssertTrue(converged, "an epoch change on a live link must still be noticed; metrics: \(view.metrics)")
+        XCTAssertEqual(view.cursor.epoch, 2)
+        XCTAssertTrue(view.invariants.passed, "violations: \(view.invariants.violations)")
+    }
+
     func testCompactedServerLogForcesAnAttachSnapshotAndStillConverges() async {
         let server = ScriptedSessionServer(epoch: 1, events: SessionScript.turn(epoch: 1, parallelCalls: 2, textTokens: 20))
         await server.compact(keepingLast: 3)

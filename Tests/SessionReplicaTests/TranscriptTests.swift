@@ -150,4 +150,57 @@ final class TranscriptTests: XCTestCase {
         XCTAssertEqual(empty, "")
         XCTAssertEqual(allElided, 3, "a negative budget clamps to zero rather than trapping")
     }
+
+    /// `maxEntries` bounds the entry *count*, not memory. A long streaming
+    /// turn with no structural events coalesces into a single entry, and that
+    /// one `String` must not grow without limit in a library whose premise is
+    /// long-running sessions.
+    func testASingleCoalescedTextEntryIsBoundedInCharacters() {
+        var transcript = TranscriptState(policy: TranscriptPolicy(maxEntries: 100, maxTextCharacters: 50))
+        for i in 1...200 { transcript.apply(text(1, UInt64(i), "0123456789")) }
+        guard case .assistantText(let body)? = transcript.entries.first else {
+            return XCTFail("expected one coalesced entry, got \(transcript.entries)")
+        }
+        XCTAssertEqual(transcript.entries.count, 1, "the deltas must genuinely have coalesced into one entry")
+        XCTAssertEqual(body.count, 50, "the entry is capped")
+        XCTAssertEqual(transcript.charactersElided, 2_000 - 50, "…and the elision is reported, not silent")
+        XCTAssertTrue(body.hasSuffix("0123456789"), "the newest text survives; the front is dropped")
+
+        // Control: under the cap, nothing is touched or reported.
+        var roomy = TranscriptState(policy: TranscriptPolicy(maxEntries: 100, maxTextCharacters: 10_000))
+        for i in 1...5 { roomy.apply(text(1, UInt64(i), "0123456789")) }
+        XCTAssertEqual(roomy.charactersElided, 0)
+        guard case .assistantText(let short)? = roomy.entries.first else { return XCTFail("no entry") }
+        XCTAssertEqual(short.count, 50)
+    }
+
+    /// A snapshot restores entries by replaying `append`, which rebuilds
+    /// `callIndex` but knows nothing about orphans. Without an explicit
+    /// rebuild the orphan set starts empty: the budget under-counts, and two
+    /// identically-rendered transcripts compare unequal because `==` includes
+    /// `orphanCallIDs`.
+    func testRestoringFromASnapshotRebuildsTheOrphanSet() {
+        var live = TranscriptState(policy: TranscriptPolicy(maxOrphanResults: 4, maxEntries: 50))
+        for i in 1...3 {
+            live.apply(SessionEvent(epoch: 1, sequence: UInt64(i),
+                                    .toolCallResult(callID: ToolCallID("orphan-\(i)"), output: "o", isError: false)))
+        }
+        XCTAssertEqual(live.orphanCallIDs.count, 3, "three results with no starts")
+
+        let restored = TranscriptState(policy: live.policy, entries: live.entries)
+        XCTAssertEqual(restored.orphanCallIDs, live.orphanCallIDs,
+                       "the orphan set must survive a snapshot round-trip")
+        XCTAssertEqual(restored, live,
+                       "…so two transcripts that render identically also compare equal")
+
+        // And the budget is genuinely re-armed rather than reset: the restored
+        // transcript must refuse the 5th orphan, exactly as the live one would.
+        var afterRestore = restored
+        for i in 4...6 {
+            afterRestore.apply(SessionEvent(epoch: 1, sequence: UInt64(i),
+                                            .toolCallResult(callID: ToolCallID("orphan-\(i)"), output: "o", isError: false)))
+        }
+        XCTAssertEqual(afterRestore.orphanCallIDs.count, 4, "capped at maxOrphanResults, not 4 + 3")
+        XCTAssertGreaterThan(afterRestore.orphansDiscarded, 0, "the overflow is counted, not silent")
+    }
 }

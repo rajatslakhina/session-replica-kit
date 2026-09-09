@@ -99,18 +99,48 @@ final class PrimitiveTests: XCTestCase {
 
     /// The policy structs clamp in `init`, but every field is a `public var`,
     /// so a caller can put them back out of range. Nothing may trap.
+    ///
+    /// Each mutation below must actually *reach* the code path it is aimed at.
+    /// A mutation that is never read makes the test look thorough while
+    /// proving nothing, so every field set here is exercised by the call that
+    /// follows it.
     func testMutatedPoliciesCannotTrapAtPointOfUse() {
         var chaos = ChaosPolicy(heartbeatEvery: 4)
         chaos.heartbeatEvery = 0                     // would trap on `% 0`
-        chaos.stallHeartbeats = -1
+        chaos.reorderWindow = -1                     // would trap: `end < index`
         let events = (1...8).map { ev(1, UInt64($0)) }
         XCTAssertFalse(ChaosScheduler.schedule(events, policy: chaos, connectionIndex: 1).isEmpty)
+
+        // A zero window is the other half: it leaves `index` unmoved and spins
+        // forever. Nothing to assert but arrival — reaching the next line at
+        // all is the result.
+        chaos.reorderWindow = 0
+        XCTAssertFalse(ChaosScheduler.schedule(events, policy: chaos, connectionIndex: 2).isEmpty,
+                       "a zero reorder window must terminate, not spin")
+        chaos.reorderWindow = Int.max                // would overflow `index + window`
+        XCTAssertFalse(ChaosScheduler.schedule(events, policy: chaos, connectionIndex: 3).isEmpty)
+
+        // `stallHeartbeats` is read by `ChaosTransport.open`, not by the
+        // scheduler, so it has to be mutated against a transport to mean
+        // anything. Opening and immediately closing exercises the read.
+        var stalling = ChaosPolicy(stallAfterFrames: 2, stallHeartbeats: 4)
+        stalling.stallHeartbeats = -1
+        let transport = ChaosTransport(server: ScriptedSessionServer(epoch: 1, events: events), policy: stalling)
+        _ = transport.open(resumingFrom: .unattached)
+        transport.close()
 
         var transcriptPolicy = TranscriptPolicy(maxOrphanResults: 4, maxEntries: 4)
         transcriptPolicy.maxEntries = -5             // would trip `removeFirst`
         transcriptPolicy.maxOrphanResults = -2
+        transcriptPolicy.maxTextCharacters = -9      // would trip `suffix`
         var transcript = TranscriptState(policy: transcriptPolicy)
         for i in 1...6 { transcript.apply(text(1, UInt64(i), "x\(i)")) }
+        // Reach the orphan path too: a result with no start is what consults
+        // `maxOrphanResults`, and plain text deltas never do.
+        for i in 7...9 {
+            transcript.apply(SessionEvent(epoch: 1, sequence: UInt64(i),
+                                          .toolCallResult(callID: ToolCallID("orphan-\(i)"), output: "o", isError: false)))
+        }
         XCTAssertGreaterThanOrEqual(transcript.entries.count, 1)
 
         var outboxPolicy = OutboxPolicy(capacity: 4, historyLimit: 2, maxAttempts: 2)
@@ -123,6 +153,36 @@ final class PrimitiveTests: XCTestCase {
             _ = outbox.acknowledge(id, accepted: true)
         }
         XCTAssertGreaterThan(outbox.historyEvicted, 0, "eviction must be counted, not silent")
+
+        // The remaining three policies, each driven through the code that
+        // reads it. The `Millis`/`UInt64` fields cannot go negative — the type
+        // system already forbids it — so `0` is their trap-adjacent value: it
+        // is what would divide by zero or underflow a saturating subtraction.
+        var ingest = IngestPolicy(maxReorderWindow: 4, maxGapWidth: 4)
+        ingest.maxReorderWindow = -1
+        ingest.maxGapWidth = 0
+        var ingestor = EventIngestor(cursor: ReplicaCursor(epoch: 1, lastApplied: 0), policy: ingest)
+        _ = ingestor.ingest(ev(1, 9))
+        _ = ingestor.observe(heartbeatNewest: UInt64.max, epoch: 1)
+
+        var publish = PublishPolicy(byteThreshold: 8, maxLatency: 8)
+        publish.byteThreshold = -1
+        publish.maxLatency = 0
+        var gate = PublishGate(policy: publish)
+        _ = gate.record(ev(1, 1), now: 0)
+        _ = gate.flushIfDue(now: 0)
+
+        var supervisorPolicy = SupervisorPolicy()
+        supervisorPolicy.baseBackoff = 0
+        supervisorPolicy.maxBackoff = 0
+        supervisorPolicy.maxAttempts = -1
+        supervisorPolicy.heartbeatInterval = 0
+        supervisorPolicy.jitterFraction = 9              // far out of 0...1
+        var supervisor = ConnectionSupervisor(policy: supervisorPolicy)
+        _ = supervisor.handle(.connectRequested(now: 0))
+        _ = supervisor.handle(.transportFailed(now: 1, reason: "x"))
+        _ = supervisor.handle(.tick(now: 2, jitter: 1.5))  // jitter out of 0...1 too
+        _ = supervisor.handle(.tick(now: 3, jitter: .nan)) // and NaN, which would trap on Int(_:)
     }
 
     // MARK: Event sizing
