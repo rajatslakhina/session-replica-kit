@@ -31,29 +31,44 @@ public final class SessionReplicaDemoModel {
         self.transport = transport
         self.chaos = chaos
         self.replica = SessionReplica(configuration: configuration,
-                                      clock: { Millis(max(0, ProcessInfo.processInfo.systemUptime * 1_000)) },
+                                      clock: { Millis(Saturating.int(from: ProcessInfo.processInfo.systemUptime * 1_000).magnitude) },
                                       jitter: { Double.random(in: 0..<1) })
     }
 
     public func start() {
-        guard runTask == nil else { return }
-        observeTask = Task { [weak self, replica] in
-            for await view in replica.views {
-                guard let self, !Task.isCancelled else { return }
-                self.view = view
+        // The view observer is started exactly once and never cancelled while
+        // the model lives. Cancelling the *consumer* of an `AsyncStream`
+        // finishes the stream itself, and `replica.views` is a `let` created in
+        // the replica's `init` — so cancelling here would permanently kill
+        // every future publish and freeze the UI on its last frame. Only the
+        // run loop is restarted on reconnect.
+        if observeTask == nil {
+            observeTask = Task { [weak self, replica] in
+                for await view in replica.views {
+                    guard let self else { return }
+                    self.view = view
+                }
             }
         }
+        guard runTask == nil else { return }
         runTask = Task { [replica, transport] in
             await replica.run(transport: transport, tickEvery: 50)
         }
     }
 
+    /// Stops the run loop and drops the link. The view observer stays alive so
+    /// the UI keeps rendering; `start()` brings the loop back.
     public func stop() {
         runTask?.cancel()
-        observeTask?.cancel()
         runTask = nil
-        observeTask = nil
         transport.close()
+    }
+
+    /// Tears everything down for good. After this the model cannot be restarted.
+    public func shutDown() {
+        stop()
+        observeTask?.cancel()
+        observeTask = nil
     }
 
     public func reconnect() {
@@ -86,8 +101,18 @@ public final class SessionReplicaDemoModel {
         }
     }
 
+    /// Compaction only *forces an attach snapshot* when the replica's cursor is
+    /// behind the compaction point. A caught-up replica is still servable, so
+    /// compacting alone would visibly do nothing. Append a turn first, then
+    /// compact past it: now the cursor genuinely cannot be replayed from, which
+    /// is the case this control exists to demonstrate.
     public func compactLog() {
         Task { [server, transport] in
+            let epoch = await server.epoch
+            let next = await server.newestSequence
+            await server.append(contentsOf: SessionScript.turn(epoch: epoch,
+                                                               startingAt: Saturating.add(next, 1),
+                                                               seed: Saturating.add(next, 3)))
             await server.compact(keepingLast: 4)
             transport.close()
         }
@@ -344,10 +369,10 @@ public struct SessionReplicaDemoView: View {
     private var chaosTab: some View {
         Form {
             Section("Link faults (applied to the next connection)") {
-                LabeledContent("Drop \(Int(model.chaos.dropProbability * 100))%") {
+                LabeledContent("Drop \(Saturating.int(from: model.chaos.dropProbability * 100))%") {
                     Slider(value: $model.chaos.dropProbability, in: 0...0.5)
                 }
-                LabeledContent("Duplicate \(Int(model.chaos.duplicateProbability * 100))%") {
+                LabeledContent("Duplicate \(Saturating.int(from: model.chaos.duplicateProbability * 100))%") {
                     Slider(value: $model.chaos.duplicateProbability, in: 0...0.5)
                 }
                 Stepper("Reorder window: \(model.chaos.reorderWindow)", value: $model.chaos.reorderWindow, in: 1...8)
@@ -458,6 +483,7 @@ public struct SessionReplicaDemoView: View {
                 LabeledContent("Events per publish", value: m.publishes > 0
                                ? String(format: "%.1f", Double(m.eventsApplied) / Double(m.publishes)) : "—")
                 metric("Transcript entries", model.view?.transcript.entries.count ?? 0)
+                metric("Transcript entries dropped", model.view?.transcript.droppedFromFront ?? 0)
             }
             Section("Invariants (re-derived from the journal)") {
                 if let invariants {
