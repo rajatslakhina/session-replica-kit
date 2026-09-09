@@ -158,12 +158,27 @@ final class PrimitiveTests: XCTestCase {
         // reads it. The `Millis`/`UInt64` fields cannot go negative — the type
         // system already forbids it — so `0` is their trap-adjacent value: it
         // is what would divide by zero or underflow a saturating subtraction.
+        //
+        // Each of these needs its *own* ingestor. A single one latches on the
+        // first resync and then short-circuits every later call at the
+        // `awaitingResync` guard, so the second and third mutations would
+        // never be read — the exact failure mode this test exists to avoid.
         var ingest = IngestPolicy(maxReorderWindow: 4, maxGapWidth: 4)
         ingest.maxReorderWindow = -1
-        ingest.maxGapWidth = 0
-        var ingestor = EventIngestor(cursor: ReplicaCursor(epoch: 1, lastApplied: 0), policy: ingest)
-        _ = ingestor.ingest(ev(1, 9))
-        _ = ingestor.observe(heartbeatNewest: UInt64.max, epoch: 1)
+        ingest.maxGapWidth = 1_000                   // wide, so the gap check passes
+        var reorderIngestor = EventIngestor(cursor: ReplicaCursor(epoch: 1, lastApplied: 0), policy: ingest)
+        _ = reorderIngestor.ingest(ev(1, 3))         // buffers, reaching the window comparison
+        _ = reorderIngestor.ingest(ev(1, 4))
+
+        var gapPolicy = IngestPolicy(maxReorderWindow: 4, maxGapWidth: 4)
+        gapPolicy.maxGapWidth = 0
+        var gapIngestor = EventIngestor(cursor: ReplicaCursor(epoch: 1, lastApplied: 0), policy: gapPolicy)
+        _ = gapIngestor.ingest(ev(1, 9))
+
+        var lagPolicy = IngestPolicy(maxReorderWindow: 4, maxGapWidth: 4)
+        lagPolicy.maxGapWidth = 0
+        var lagIngestor = EventIngestor(cursor: ReplicaCursor(epoch: 1, lastApplied: 0), policy: lagPolicy)
+        _ = lagIngestor.observe(heartbeatNewest: UInt64.max, epoch: 1)
 
         var publish = PublishPolicy(byteThreshold: 8, maxLatency: 8)
         publish.byteThreshold = -1

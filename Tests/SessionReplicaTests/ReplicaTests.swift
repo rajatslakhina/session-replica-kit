@@ -235,22 +235,81 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(resent?.id, id, "the same id is retried; the server deduplicates")
     }
 
-    /// The other half: a command that has exhausted its attempts must fail
-    /// rather than loop forever. Without this the fix above would be an
-    /// infinite retry machine.
-    func testAStrandedCommandOutOfAttemptsFailsInsteadOfLooping() async {
+    /// The other half of the stranding fix: the re-queue must NOT fabricate a
+    /// terminal `.failed`. `reconcile` only touches non-terminal commands, so
+    /// a command failed by a dead socket could never be corrected by the
+    /// server's own snapshot — the UI would show "failed" forever for a
+    /// command the agent actually executed. Keeping it `.queued` is what
+    /// preserves "server wins".
+    func testAStrandedCommandStaysCorrectableByTheServer() async {
         let replica = self.replica(ReplicaConfiguration(outbox: OutboxPolicy(capacity: 4, historyLimit: 8, maxAttempts: 1)))
         let id = CommandID("stop-1")
         await replica.receive(snapshot: snapshot())
         await replica.enqueue(.stop, id: id)
         _ = await replica.dequeueForDelivery()
-        await replica.transportClosed(reason: "connection dropped")
 
-        let view = await replica.view
-        guard case .failed = view.outbox.first?.state else {
-            return XCTFail("expected .failed, got \(String(describing: view.outbox.first?.state))")
+        // Attempts are already exhausted (maxAttempts: 1) — the tempting fix
+        // is to fail it here. That is the bug.
+        await replica.transportClosed(reason: "connection dropped")
+        let stranded = await replica.view
+        XCTAssertEqual(stranded.outbox.first?.state, .queued,
+                       "a dead socket is not a verdict on the command")
+
+        // The server now says the agent did acknowledge it. That must land.
+        await replica.receive(snapshot: snapshot(sequence: 9, fates: [id: .acknowledged(accepted: true)]))
+        let after = await replica.view
+        XCTAssertEqual(after.outbox.first?.state, .acknowledged(accepted: true),
+                       "the authority's verdict must be able to reach the command")
+        XCTAssertTrue(after.invariants.passed, "violations: \(after.invariants.violations)")
+    }
+
+    /// A supervisor-declared resync journals `.resyncRequested`, and the
+    /// checker treats any such record as a latch. So the ingestor must
+    /// actually latch — otherwise a degraded link flushing its backlog before
+    /// the snapshot arrives makes the checker report FAIL for a replica that
+    /// did nothing wrong. The journal must never claim more than is true.
+    func testASupervisorDeclaredResyncActuallyLatchesTheIngestor() async {
+        let replica = self.replica()
+        await replica.receive(snapshot: snapshot())
+        for event in SessionScript.turn(epoch: 1, parallelCalls: 1, textTokens: 4) {
+            await replica.receive(event)
         }
-        let retried = await replica.dequeueForDelivery()
-        XCTAssertNil(retried, "a failed command must not be re-sent")
+        let before = await replica.view
+        XCTAssertTrue(before.invariants.passed)
+        let appliedBefore = before.metrics.eventsApplied
+
+        await replica.declareStalledForTesting()
+
+        // The starved link now flushes content that was already in flight.
+        let next = await replica.currentCursor.nextExpected
+        for offset in UInt64(0)..<3 {
+            await replica.receive(text(1, next + offset, "late-\(offset)"))
+        }
+
+        let after = await replica.view
+        XCTAssertTrue(after.invariants.passed,
+                      "content arriving between a supervisor resync and its snapshot must not read as a violation: \(after.invariants.violations)")
+        XCTAssertEqual(after.metrics.eventsApplied, appliedBefore,
+                       "…because the latch genuinely refused them, rather than the checker being lenient")
+        XCTAssertNotNil(after.awaitingResync)
+    }
+
+    /// The invariant report is memoised on the journal revision. A cache that
+    /// never invalidated would keep every other test green, because they all
+    /// assert PASS — so this one drives a real violation in after a PASS and
+    /// asserts the verdict flips.
+    func testTheMemoisedInvariantVerdictIsInvalidatedByNewJournalRecords() async {
+        let replica = self.replica()
+        await replica.receive(snapshot: snapshot())
+        for event in SessionScript.turn(epoch: 1, parallelCalls: 1, textTokens: 4) {
+            await replica.receive(event)
+        }
+        let baseline = await replica.view.invariants.passed
+        XCTAssertTrue(baseline, "baseline must pass")
+
+        await replica.journalForTesting(.applied(EventID(epoch: 1, sequence: 1)))
+        let after = await replica.view
+        XCTAssertFalse(after.invariants.passed,
+                       "a stale cache would still report PASS here")
     }
 }

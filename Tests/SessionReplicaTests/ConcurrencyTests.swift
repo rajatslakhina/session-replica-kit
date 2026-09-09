@@ -177,13 +177,20 @@ final class ConcurrencyTests: XCTestCase {
         await replica.receive(snapshot: SessionSnapshot(cursor: EventID(epoch: 1, sequence: 0),
                                                         state: AuthoritativeState(), transcript: []))
         let events = SessionScript.turn(epoch: 1, parallelCalls: 3, textTokens: 200)
-        // Deliberately never consume `replica.views`.
+        // Subscribe, then deliberately never read. Without this `let` there is
+        // no observer at all, `yield` iterates an empty registry, and the test
+        // would pass against a blocking send — i.e. it would not be testing
+        // backpressure, only that a loop terminates.
+        let unread = replica.views
         let start = ContinuousClock.now
         for event in events { await replica.receive(event) }
         let elapsed = start.duration(to: ContinuousClock.now)
         XCTAssertLessThan(elapsed, .seconds(5), "an unread view stream must not stall ingestion")
         let view = await replica.view
         XCTAssertEqual(view.metrics.eventsApplied, events.count)
+        XCTAssertGreaterThan(view.metrics.viewsDropped, 0,
+                             "the observer must genuinely have been registered and evicting")
+        _ = unread
     }
 
     func testASingleWriterProducesNoViolationsEither() async {
